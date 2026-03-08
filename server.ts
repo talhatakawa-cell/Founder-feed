@@ -1,9 +1,6 @@
 import express from 'express';
 import { createServer as createViteServer } from 'vite';
 import Database from 'better-sqlite3';
-import bcrypt from 'bcryptjs';
-import jwt from 'jsonwebtoken';
-import cookieParser from 'cookie-parser';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { createServer } from 'http';
@@ -11,11 +8,19 @@ import { Server } from 'socket.io';
 import multer from 'multer';
 import fs from 'fs';
 import cors from 'cors';
+import admin from "firebase-admin";
+import fetch from "node-fetch";
+import jwt from "jsonwebtoken";
+
+// Initialize Firebase Admin SDK
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const db = new Database('founderfeed.db');
 db.pragma('foreign_keys = ON');
-const JWT_SECRET = process.env.JWT_SECRET || 'founder-secret-key-123';
+  'founder-secret-key-123';
+admin.initializeApp({
+  credential: admin.credential.applicationDefault()
+});
 
 // Patch BigInt to work with JSON.stringify
 (BigInt.prototype as any).toJSON = function () {
@@ -286,7 +291,7 @@ async function startServer() {
 );
 
   app.use(express.json());
-  app.use(cookieParser());
+  
   app.use('/uploads', express.static(uploadDir));
 
   // Request Logger
@@ -297,77 +302,61 @@ async function startServer() {
     next();
   });
 
-  // Auth Middleware
-  const authenticateToken = (req: any, res: any, next: any) => {
-    try {
-      const token = req.cookies.token;
-      if (!token) return res.status(401).json({ error: 'Unauthorized' });
+  const authenticateToken = async (req:any,res:any,next:any)=>{
+  try{
+    const authHeader = req.headers.authorization;
 
-      jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
-        if (err) {
-          console.error('JWT Verify Error:', err.message);
-          return res.status(403).json({ error: 'Forbidden: Invalid session' });
-        }
-        req.user = user;
-        next();
-      });
-    } catch (error) {
-      console.error('Auth Middleware Error:', error);
-      res.status(500).json({ error: 'Authentication system error' });
+    if(!authHeader || !authHeader.startsWith("Bearer "))
+      return res.status(401).json({error:"Unauthorized"});
+
+    const token = authHeader.split("Bearer ")[1];
+
+    const response = await fetch(
+      "https://www.googleapis.com/robot/v1/metadata/x509/securetoken@system.gserviceaccount.com"
+    );
+
+    const keys = await response.json();
+
+    const decoded:any = jwt.decode(token,{complete:true});
+
+    const key = keys[decoded.header.kid];
+
+    const verified:any = jwt.verify(token,key,{
+      algorithms:["RS256"]
+    });
+
+    let user:any = db.prepare(`
+      SELECT * FROM users WHERE email = ?
+    `).get(verified.email);
+
+    if(!user){
+      const result = db.prepare(`
+        INSERT INTO users (email,password,name,startup_name,role)
+        VALUES (?, '', ?, '', 'founder')
+      `).run(verified.email, verified.name || "User");
+
+      user = {
+        id:Number(result.lastInsertRowid),
+        email:verified.email
+      };
     }
-  };
+
+    req.user = {
+      id:user.id,
+      email:user.email
+    };
+
+    next();
+
+  }catch(err){
+    console.error("Auth error:",err);
+    res.status(401).json({error:"Invalid token"});
+  }
+};
 
   const apiRouter = express.Router();
 
-  // --- Auth Routes ---
-  apiRouter.post('/auth/signup', async (req, res) => {
-    const { email, password, name, startup_name, role } = req.body;
-    try {
-      const hashedPassword = await bcrypt.hash(password, 10);
-      const stmt = db.prepare('INSERT INTO users (email, password, name, startup_name, role) VALUES (?, ?, ?, ?, ?)');
-      const result = stmt.run(email, hashedPassword, name, startup_name, role);
-      
-      const token = jwt.sign({ id: Number(result.lastInsertRowid), email }, JWT_SECRET);
-      res.cookie('token', token, { 
-  httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
-});
-      res.json({ message: 'User created', user: { id: Number(result.lastInsertRowid), email, name, startup_name, role } });
-    } catch (err: any) {
-      console.error('Signup error:', err);
-      res.status(400).json({ error: err.message });
-    }
-  });
 
-  apiRouter.post('/auth/login', async (req, res) => {
-    const { email, password } = req.body;
-    try {
-      const user: any = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
-      if (!user || !(await bcrypt.compare(password, user.password))) {
-        return res.status(401).json({ error: 'Invalid credentials' });
-      }
-      const token = jwt.sign({ id: Number(user.id), email: user.email }, JWT_SECRET);
-      res.cookie('token', token, { 
-  httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
-});
-      res.json({ message: 'Logged in', user: { id: Number(user.id), email: user.email, name: user.name, startup_name: user.startup_name, role: user.role } });
-    } catch (err: any) {
-      console.error('Login error:', err);
-      res.status(500).json({ error: 'Login error' });
-    }
-  });
-
-  apiRouter.post('/auth/logout', (req, res) => {
-    res.clearCookie('token', {
-  httpOnly: true,
-  secure: process.env.NODE_ENV === 'production',
-  sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax'
-});
-    res.json({ message: 'Logged out' });
-  });
 
   apiRouter.get('/auth/me', authenticateToken, (req: any, res) => {
     try {
