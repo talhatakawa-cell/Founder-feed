@@ -3,6 +3,8 @@ import { useSearchParams } from "react-router-dom";
 import PostCard from "../components/PostCard";
 import CommentSection from "../components/CommentSection";
 
+const API_URL = "https://founder-feed-1.onrender.com";
+
 type User = {
   id: number;
   name: string;
@@ -39,7 +41,7 @@ export default function SearchPage({
 
   const handleLike = async (id: number) => {
     try {
-      const res = await fetch(`/api/posts/${id}/like`, {
+      const res = await fetch(`${API_URL}/api/posts/${id}/like`, {
         method: "POST",
       });
 
@@ -68,7 +70,7 @@ export default function SearchPage({
     if (!confirm("Are you sure you want to delete this post?")) return;
 
     try {
-      const res = await fetch(`/api/posts/${id}`, {
+      const res = await fetch(`${API_URL}/api/posts/${id}`, {
         method: "DELETE",
       });
 
@@ -85,7 +87,7 @@ export default function SearchPage({
 
   const handleEdit = async (id: number, content: string) => {
     try {
-      const res = await fetch(`/api/posts/${id}`, {
+      const res = await fetch(`${API_URL}/api/posts/${id}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ content }),
@@ -109,7 +111,7 @@ export default function SearchPage({
     if (!reason) return;
 
     try {
-      await fetch(`/api/posts/${id}/report`, {
+      await fetch(`${API_URL}/api/posts/${id}/report`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ reason }),
@@ -150,7 +152,7 @@ export default function SearchPage({
 
       try {
         const res = await fetch(
-          `/api/search?q=${encodeURIComponent(query)}`
+          `${API_URL}/api/search?q=${encodeURIComponent(query)}`
         );
 
         const contentType = res.headers.get("content-type") || "";

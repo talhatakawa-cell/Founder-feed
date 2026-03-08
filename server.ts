@@ -10,6 +10,7 @@ import { createServer } from 'http';
 import { Server } from 'socket.io';
 import multer from 'multer';
 import fs from 'fs';
+import cors from 'cors';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const db = new Database('founderfeed.db');
@@ -29,7 +30,7 @@ if (!fs.existsSync(uploadDir)) {
 
 // Multer config
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, 'uploads/'),
+  destination: (req, file, cb) => cb(null, uploadDir),
   filename: (req, file, cb) => cb(null, Date.now() + '-' + file.originalname)
 });
 const upload = multer({ 
@@ -253,12 +254,40 @@ async function startServer() {
   const app = express();
   app.set('trust proxy', 1);
   const httpServer = createServer(app);
-  const io = new Server(httpServer);
-  const PORT = 3000;
+  const io = new Server(httpServer, {
+  cors: {
+    origin: [
+      "http://localhost:3000",
+      /\.netlify\.app$/
+    ],
+    methods: ["GET", "POST"],
+    credentials: true
+  }
+});
+  const PORT = process.env.PORT || 3000;
+  app.use(
+  cors({
+    origin: (origin, callback) => {
+
+      if (!origin) return callback(null, true);
+
+      const allowed =
+        origin === "http://localhost:3000" ||
+        origin.includes(".netlify.app");
+
+      if (allowed) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("Not allowed by CORS"));
+    },
+    credentials: true
+  })
+);
 
   app.use(express.json());
   app.use(cookieParser());
-  app.use('/uploads', express.static('uploads'));
+  app.use('/uploads', express.static(uploadDir));
 
   // Request Logger
   app.use((req, res, next) => {

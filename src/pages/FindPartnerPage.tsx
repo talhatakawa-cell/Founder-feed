@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { User } from "../types";
+import { auth } from "../firebase";
 
 type PartnerRequest = {
   id: number;
@@ -19,6 +20,14 @@ export default function FindPartnerPage({ currentUser }: { currentUser: User }) 
   const [requests, setRequests] = useState<PartnerRequest[]>([]);
   const [agreed, setAgreed] = useState(false);
 
+  const API = "https://founder-feed-1.onrender.com";
+
+  const getToken = async () => {
+    const user = auth.currentUser;
+    if (!user) return null;
+    return await user.getIdToken();
+  };
+
   const [form, setForm] = useState({
     startup_name: "",
     website_url: "",
@@ -27,10 +36,17 @@ export default function FindPartnerPage({ currentUser }: { currentUser: User }) 
     description: "",
   });
 
-  // ✅ SAFE LOAD
+  // LOAD REQUESTS
   const loadRequests = async () => {
     try {
-      const res = await fetch("/api/partner-requests");
+      const token = await getToken();
+
+      const res = await fetch(`${API}/api/partner-requests`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
       if (!res.ok) {
         setRequests([]);
         return;
@@ -52,7 +68,7 @@ export default function FindPartnerPage({ currentUser }: { currentUser: User }) 
     loadRequests();
   }, []);
 
-  // ✅ SUBMIT
+  // SUBMIT
   const handleSubmit = async (e: any) => {
     e.preventDefault();
 
@@ -75,14 +91,20 @@ export default function FindPartnerPage({ currentUser }: { currentUser: User }) 
       return;
     }
 
-    await fetch("/api/partner-requests", {
+    const token = await getToken();
+
+    await fetch(`${API}/api/partner-requests`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
       body: JSON.stringify(form),
     });
 
     setOpen(false);
     setAgreed(false);
+
     setForm({
       startup_name: "",
       website_url: "",
@@ -94,12 +116,17 @@ export default function FindPartnerPage({ currentUser }: { currentUser: User }) 
     loadRequests();
   };
 
-  // ✅ DELETE (OWNER ONLY)
+  // DELETE
   const handleDelete = async (id: number) => {
     if (!confirm("Are you sure you want to delete this request?")) return;
 
-    await fetch(`/api/partner-requests/${id}`, {
+    const token = await getToken();
+
+    await fetch(`${API}/api/partner-requests/${id}`, {
       method: "DELETE",
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
     });
 
     loadRequests();
@@ -150,7 +177,6 @@ export default function FindPartnerPage({ currentUser }: { currentUser: User }) 
               </Link>
 
               <div className="flex-1">
-                {/* STARTUP NAME → PROFILE */}
                 <Link
                   to={`/profile/${r.user_id}`}
                   className="text-lg font-semibold text-emerald-400 hover:underline"
@@ -163,6 +189,7 @@ export default function FindPartnerPage({ currentUser }: { currentUser: User }) 
                 <div className="mt-4 text-sm text-zinc-400 space-y-1">
                   <div>Revenue: {r.monthly_revenue || "—"}</div>
                   <div>Looking for: {r.needed_role}</div>
+
                   {r.website_url && (
                     <div>
                       Website:{" "}
@@ -177,7 +204,6 @@ export default function FindPartnerPage({ currentUser }: { currentUser: User }) 
                   )}
                 </div>
 
-                {/* OWNER DELETE */}
                 {r.user_id === currentUser.id && (
                   <button
                     onClick={() => handleDelete(r.id)}
@@ -289,7 +315,6 @@ export default function FindPartnerPage({ currentUser }: { currentUser: User }) 
 
                 </div>
 
-                {/* ✅ POLISHED RISK AGREEMENT */}
                 <div className="flex items-start gap-3 text-sm text-zinc-400">
                   <input
                     type="checkbox"
@@ -299,9 +324,7 @@ export default function FindPartnerPage({ currentUser }: { currentUser: User }) 
                   />
                   <p>
                     I understand that any partnership or collaboration formed through this platform
-                    is undertaken at my own discretion and risk. The platform shall not be held
-                    responsible for any disputes, misunderstandings, financial losses, or future
-                    conflicts arising from such engagements.
+                    is undertaken at my own discretion and risk.
                   </p>
                 </div>
 

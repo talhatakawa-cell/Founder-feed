@@ -1,6 +1,9 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Loader2 } from "lucide-react";
+import { auth } from "../firebase";
+
+const API_URL = "https://founder-feed-1.onrender.com";
 
 export default function AskQuestionPage({ currentUser }: { currentUser: any }) {
   const [title, setTitle] = useState("");
@@ -15,17 +18,29 @@ export default function AskQuestionPage({ currentUser }: { currentUser: any }) {
     setLoading(true);
 
     try {
-      const res = await fetch("/api/questions", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        credentials: "include", // ✅ VERY IMPORTANT
-        body: JSON.stringify({
-          title: title.trim(),
-          description: description.trim(),
-        }),
-      });
+      const user = auth.currentUser;
+
+      if (!user) {
+        alert("You must be logged in.");
+        return;
+      }
+
+      const token = await user.getIdToken();
+
+      const res = await fetch(
+        `${API_URL}/api/questions`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Authorization: `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            title: title.trim(),
+            description: description.trim(),
+          }),
+        }
+      );
 
       if (res.ok) {
         const data = await res.json();

@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { useNavigate, Link } from "react-router-dom";
+import { auth } from "../firebase";
 
 type InvestorRequest = {
   id: number;
@@ -31,6 +32,14 @@ export default function InvestorList() {
   const [me, setMe] = useState<Me | null>(null);
   const [loading, setLoading] = useState(false);
 
+  const API = "https://founder-feed-1.onrender.com";
+
+  const getToken = async () => {
+    const user = auth.currentUser;
+    if (!user) return null;
+    return await user.getIdToken();
+  };
+
   const [form, setForm] = useState({
     startup_name: "",
     website_url: "",
@@ -42,14 +51,26 @@ export default function InvestorList() {
   });
 
   const loadMe = async () => {
-    const res = await fetch("/api/auth/me", { credentials: "include" });
+    const token = await getToken();
+
+    const res = await fetch(`${API}/api/auth/me`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+
     if (res.ok) setMe(await res.json());
   };
 
   const loadRequests = async () => {
-    const res = await fetch("/api/investor-requests", {
-      credentials: "include",
+    const token = await getToken();
+
+    const res = await fetch(`${API}/api/investor-requests`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
     });
+
     if (res.ok) setRequests(await res.json());
   };
 
@@ -98,11 +119,16 @@ export default function InvestorList() {
     }
 
     setLoading(true);
+
     try {
-      const res = await fetch("/api/investor-requests", {
+      const token = await getToken();
+
+      const res = await fetch(`${API}/api/investor-requests`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
         body: JSON.stringify(payload),
       });
 
@@ -124,9 +150,13 @@ export default function InvestorList() {
   const handleDelete = async (id: number) => {
     if (!confirm("Do you want to delete this request?")) return;
 
-    const res = await fetch(`/api/investor-requests/${id}`, {
+    const token = await getToken();
+
+    const res = await fetch(`${API}/api/investor-requests/${id}`, {
       method: "DELETE",
-      credentials: "include",
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
     });
 
     const data = await res.json().catch(() => ({}));
@@ -171,10 +201,9 @@ export default function InvestorList() {
 
                   {/* FOUNDER AVATAR */}
                   <Link
-  to={`/profile/${r.user_id}`}
-  className="flex-shrink-0 w-10 h-10 rounded-xl overflow-hidden border border-zinc-700"
->
-                  
+                    to={`/profile/${r.user_id}`}
+                    className="flex-shrink-0 w-10 h-10 rounded-xl overflow-hidden border border-zinc-700"
+                  >
                     {r.founder_avatar ? (
                       <img
                         src={r.founder_avatar}

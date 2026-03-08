@@ -4,6 +4,7 @@ import { Rocket, Plus, ExternalLink, Heart, MessageSquare, Globe, Trash2, X, Ima
 import { motion, AnimatePresence } from 'motion/react';
 import { formatDistanceToNow } from 'date-fns';
 import { Link } from 'react-router-dom';
+import { auth } from "../firebase";
 
 interface LaunchPageProps {
   currentUser: User;
@@ -14,6 +15,14 @@ export default function LaunchPage({ currentUser }: LaunchPageProps) {
   const [loading, setLoading] = useState(true);
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const API_BASE = "https://founder-feed-1.onrender.com";
+
+const getToken = async () => {
+  const user = auth.currentUser;
+  if (!user) return null;
+  return await user.getIdToken();
+};
 
   // Form state
   const [name, setName] = useState('');
@@ -28,18 +37,27 @@ export default function LaunchPage({ currentUser }: LaunchPageProps) {
   }, []);
 
   const fetchProducts = async () => {
-    try {
-      const res = await fetch('/api/products');
-      if (res.ok) {
-        const data = await res.json();
-        setProducts(data);
-      }
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoading(false);
+  try {
+
+    const token = await getToken();
+
+    const res = await fetch(`${API_BASE}/api/products`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      setProducts(data);
     }
-  };
+
+  } catch (err) {
+    console.error(err);
+  } finally {
+    setLoading(false);
+  }
+};
 
   const handleImageChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -66,10 +84,15 @@ export default function LaunchPage({ currentUser }: LaunchPageProps) {
     if (image) formData.append('image', image);
 
     try {
-      const res = await fetch('/api/products', {
-        method: 'POST',
-        body: formData,
-      });
+      const token = await getToken();
+
+const res = await fetch(`${API_BASE}/api/products`, {
+  method: "POST",
+  headers: {
+    Authorization: `Bearer ${token}`,
+  },
+  body: formData,
+});
       if (res.ok) {
         setIsModalOpen(false);
         setName('');
@@ -89,7 +112,14 @@ export default function LaunchPage({ currentUser }: LaunchPageProps) {
 
   const toggleLike = async (productId: number) => {
     try {
-      const res = await fetch(`/api/products/${productId}/like`, { method: 'POST' });
+     const token = await getToken();
+
+const res = await fetch(`${API_BASE}/api/products/${productId}/like`, {
+  method: "POST",
+  headers: {
+    Authorization: `Bearer ${token}`,
+  },
+});
       if (res.ok) {
         const { liked } = await res.json();
         setProducts(prev => prev.map(p => {
@@ -267,53 +297,82 @@ function ProductCard({ product, onLike, currentUser }: { product: Product, onLik
   const [replyTo, setReplyTo] = useState<ProductComment | null>(null);
   const [loadingComments, setLoadingComments] = useState(false);
 
-  const fetchComments = async () => {
-    setLoadingComments(true);
-    try {
-      const res = await fetch(`/api/products/${product.id}/comments`);
-      if (res.ok) {
-        const data = await res.json();
-        setComments(data);
-      }
-    } catch (err) {
-      console.error(err);
-    } finally {
-      setLoadingComments(false);
-    }
-  };
+  const API_BASE = "https://founder-feed-1.onrender.com";
 
+const getToken = async () => {
+  const user = auth.currentUser;
+  if (!user) return null;
+  return await user.getIdToken();
+};
+
+const fetchComments = async () => {
+  setLoadingComments(true);
+
+  try {
+    const token = await getToken();
+
+    const res = await fetch(`${API_BASE}/api/products/${product.id}/comments`, {
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      setComments(data);
+    }
+
+  } catch (err) {
+    console.error(err);
+  } finally {
+    setLoadingComments(false);
+  }
+};
   useEffect(() => {
     if (showComments) {
       fetchComments();
     }
   }, [showComments]);
 
-  const handleComment = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!newComment.trim()) return;
+ const handleComment = async (e: React.FormEvent) => {
+  e.preventDefault();
+  if (!newComment.trim()) return;
 
-    try {
-      const res = await fetch(`/api/products/${product.id}/comments`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ 
-          content: newComment,
-          parent_id: replyTo ? replyTo.id : null
-        }),
-      });
-      if (res.ok) {
-        setNewComment('');
-        setReplyTo(null);
-        fetchComments();
-      }
-    } catch (err) {
-      console.error(err);
+  try {
+
+    const token = await getToken();
+
+    const res = await fetch(`${API_BASE}/api/products/${product.id}/comments`, {
+      method: 'POST',
+      headers: { 
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify({ 
+        content: newComment,
+        parent_id: replyTo ? replyTo.id : null
+      }),
+    });
+
+    if (res.ok) {
+      setNewComment('');
+      setReplyTo(null);
+      fetchComments();
     }
-  };
+
+  } catch (err) {
+    console.error(err);
+  }
+};
 
   const deleteComment = async (commentId: number) => {
     try {
-      const res = await fetch(`/api/products/${product.id}/comments/${commentId}`, { method: 'DELETE' });
+      const res = await fetch(`${API_BASE}/api/products/${product.id}/comments/${commentId}`, { 
+  method: 'DELETE',
+  headers: {
+    Authorization: `Bearer ${await getToken()}`,
+  },
+});
       if (res.ok) {
         fetchComments();
       }

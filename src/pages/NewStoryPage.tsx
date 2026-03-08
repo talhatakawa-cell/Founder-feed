@@ -1,6 +1,7 @@
 import { useState, useRef } from "react";
 import { useNavigate } from "react-router-dom";
 import { User } from "../types";
+import { auth } from "../firebase";
 
 export default function NewStoryPage({ currentUser }: { currentUser: User | null }) {
   const navigate = useNavigate();
@@ -27,15 +28,26 @@ export default function NewStoryPage({ currentUser }: { currentUser: User | null
 
     setLoading(true);
     try {
-      const res = await fetch("/api/stories", {
-  method: "POST",
-  headers: { "Content-Type": "application/json" },
-  credentials: "include",  // 👈 এটা যোগ করো
-  body: JSON.stringify({
-    title: title.trim(),
-    content: content.trim(),
-  }),
-});
+
+      const user = auth.currentUser;
+      if (!user) {
+        alert("You must be logged in");
+        return;
+      }
+
+      const token = await user.getIdToken();
+
+      const res = await fetch("https://founder-feed-1.onrender.com/api/stories", {
+        method: "POST",
+        headers: { 
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          title: title.trim(),
+          content: content.trim(),
+        }),
+      });
 
       if (res.ok) {
         navigate("/stories");

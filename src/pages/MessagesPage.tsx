@@ -3,6 +3,7 @@ import { User, Conversation, Message } from '../types';
 import { Socket } from 'socket.io-client';
 import { Send, ChevronLeft, Search, ExternalLink } from 'lucide-react';
 import { Link } from 'react-router-dom';
+import { auth } from '../firebase';
 
 export default function MessagesPage({
   currentUser,
@@ -20,6 +21,20 @@ export default function MessagesPage({
   const [newMessage, setNewMessage] = useState('');
   const [loading, setLoading] = useState(true);
   const scrollRef = useRef<HTMLDivElement>(null);
+
+  const API_BASE = 'https://founder-feed-1.onrender.com';
+
+  const getAuthHeaders = async () => {
+    const user = auth.currentUser;
+    if (!user) {
+      throw new Error('No authenticated user found');
+    }
+
+    const token = await user.getIdToken();
+    return {
+      Authorization: `Bearer ${token}`,
+    };
+  };
 
   // Reset unread badge when page opens
   useEffect(() => {
@@ -64,7 +79,12 @@ export default function MessagesPage({
 
   const fetchConversations = async () => {
     try {
-      const res = await fetch('/api/conversations');
+      const headers = await getAuthHeaders();
+
+      const res = await fetch(`${API_BASE}/api/conversations`, {
+        headers,
+      });
+
       if (res.ok) {
         const data = await res.json();
         setConversations(data);
@@ -78,7 +98,12 @@ export default function MessagesPage({
 
   const fetchMessages = async (convId: number) => {
     try {
-      const res = await fetch(`/api/conversations/${convId}/messages`);
+      const headers = await getAuthHeaders();
+
+      const res = await fetch(`${API_BASE}/api/conversations/${convId}/messages`, {
+        headers,
+      });
+
       if (res.ok) {
         const data = await res.json();
         setMessages(data);

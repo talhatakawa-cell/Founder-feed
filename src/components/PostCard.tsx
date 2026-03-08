@@ -5,6 +5,8 @@ import { Post, User } from '../types';
 import { motion } from 'motion/react';
 import { Link } from 'react-router-dom';
 
+const API_URL = "https://founder-feed-1.onrender.com";
+
 interface PostCardProps {
   post: Post;
   currentUser: User | null;
@@ -45,7 +47,7 @@ export default function PostCard({
 
     setIsCoBuilding(true);
     try {
-      const res = await fetch(`/api/users/${post.user_id}/co-build`, {
+      const res = await fetch(`${API_URL}/api/users/${post.user_id}/co-build`, {
         method: 'POST',
       });
 
@@ -118,8 +120,8 @@ export default function PostCard({
 
         <div className="flex flex-col items-end gap-2">
           <span className="text-xs text-zinc-400 dark:text-zinc-600">
-  {formatDistanceToNow(new Date(post.created_at + 'Z'), { addSuffix: true })}
-</span>
+            {formatDistanceToNow(new Date(post.created_at + 'Z'), { addSuffix: true })}
+          </span>
 
           {currentUser && currentUser.id !== post.user_id && (
             <button

@@ -32,7 +32,8 @@ import {
   signOut
 } from "firebase/auth";
 
-const socket = io();
+const API_URL = "https://founder-feed-1.onrender.com";
+const socket = io(API_URL);
 
 // --- Components ---
 
@@ -45,6 +46,7 @@ function AuthPage({ onLogin }: { onLogin: (user: User) => void }) {
   const [role, setRole] = useState('');
   const [error, setError] = useState('');
   const navigate = useNavigate();
+
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -193,7 +195,7 @@ function FeedPage({ currentUser }: { currentUser: User | null }) {
 
   const fetchSuggestions = async () => {
     try {
-      const res = await fetch('/api/users/suggested');
+      const res = await fetch(`${API_URL}/api/users/suggested`);
       if (res.ok) {
         const data = await res.json();
         setSuggestedUsers(data);
@@ -230,7 +232,7 @@ function FeedPage({ currentUser }: { currentUser: User | null }) {
 
     const currentOffset = reset ? 0 : offset;
     try {
-      const res = await fetch(`/api/posts?limit=10&offset=${currentOffset}`);
+      const res = await fetch(`${API_URL}/api/posts?limit=10&offset=${currentOffset}`);
       const contentType = res.headers.get('content-type');
       const isJson = contentType && contentType.includes('application/json');
 
@@ -289,7 +291,7 @@ function FeedPage({ currentUser }: { currentUser: User | null }) {
 
     try {
       console.log('Sending POST request to /api/posts');
-      const res = await fetch('/api/posts', {
+      const res = await fetch(`${API_URL}/api/posts`, {
         method: 'POST',
         body: formData,
       });
@@ -318,7 +320,7 @@ function FeedPage({ currentUser }: { currentUser: User | null }) {
 
   const handleLike = async (id: number) => {
     try {
-      const res = await fetch(`/api/posts/${id}/like`, { method: 'POST' });
+      const res = await fetch(`${API_URL}/api/posts/${id}/like`, { method: 'POST' });
       if (res.ok) {
         setPosts(posts.map(p => {
           if (p.id === id) {
@@ -338,7 +340,7 @@ function FeedPage({ currentUser }: { currentUser: User | null }) {
     if (!confirm('Are you sure you want to delete this post?')) return;
     try {
       console.log('Sending DELETE request for post:', id);
-      const res = await fetch(`/api/posts/${id}`, { method: 'DELETE' });
+      const res = await fetch(`${API_URL}/api/posts/${id}`, { method: 'DELETE' });
       console.log('DELETE response status:', res.status);
       if (res.ok) {
         console.log('Delete successful, updating state');
@@ -356,7 +358,7 @@ function FeedPage({ currentUser }: { currentUser: User | null }) {
 
   const handleEdit = async (id: number, content: string) => {
     try {
-      const res = await fetch(`/api/posts/${id}`, {
+      const res = await fetch(`${API_URL}/api/posts/${id}`, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ content }),
@@ -373,7 +375,7 @@ function FeedPage({ currentUser }: { currentUser: User | null }) {
     const reason = prompt('Why are you reporting this post?');
     if (!reason) return;
     try {
-      const res = await fetch(`/api/posts/${id}/report`, {
+      const res = await fetch(`${API_URL}/api/posts/${id}/report`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason }),
@@ -537,7 +539,7 @@ function FeedPage({ currentUser }: { currentUser: User | null }) {
                   <button
                     onClick={async () => {
                       try {
-                        const res = await fetch(`/api/users/${user.id}/co-build`, { method: 'POST' });
+                        const res = await fetch(`${API_URL}/api/users/${user.id}/co-build`, { method: 'POST' });
                         if (res.ok) {
                           setSuggestedUsers(prev => prev.filter(u => u.id !== user.id));
                           setCoBuildings(prev => {
@@ -627,7 +629,7 @@ function ProfilePage({ currentUser, onUpdate }: { currentUser: User | null, onUp
   const fetchUserPosts = async (userId: string | number) => {
     setPostsLoading(true);
     try {
-      const res = await fetch(`/api/posts/user/${userId}`);
+      const res = await fetch(`${API_URL}/api/posts/user/${userId}`);
       if (res.ok) {
         const data = await res.json();
         setPosts(data);
@@ -645,7 +647,7 @@ function ProfilePage({ currentUser, onUpdate }: { currentUser: User | null, onUp
       try {
         const targetId = id || currentUser?.id;
         if (!targetId) return;
-        const res = await fetch(`/api/users/${targetId}`);
+        const res = await fetch(`${API_URL}/api/users/${targetId}`);
         if (res.ok) {
           const data = await res.json();
           setUser(data);
@@ -691,7 +693,7 @@ function ProfilePage({ currentUser, onUpdate }: { currentUser: User | null, onUp
     if (!user || !currentUser) return;
     setIsCoBuilding(true);
     try {
-      const res = await fetch(`/api/users/${user.id}/co-build`, { method: 'POST' });
+      const res = await fetch(`${API_URL}/api/users/${user.id}/co-build`, { method: 'POST' });
       if (res.ok) {
         const data = await res.json();
         setUser(prev => prev ? {
@@ -713,7 +715,7 @@ function ProfilePage({ currentUser, onUpdate }: { currentUser: User | null, onUp
     setSendingMessage(true);
 
     try {
-      const res = await fetch('/api/messages', {
+      const res = await fetch(`${API_URL}/api/messages`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -756,7 +758,7 @@ function ProfilePage({ currentUser, onUpdate }: { currentUser: User | null, onUp
     }
 
     try {
-      const res = await fetch("/api/profile", {
+      const res = await fetch("https://founder-feed-1.onrender.com/api/profile", {
         method: "PUT",
         body: data,
       });
@@ -1057,7 +1059,7 @@ function AdminPage() {
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    fetch('/api/admin/reports')
+    fetch(`${API_URL}/api/admin/reports`)
       .then(res => {
         if (!res.ok) throw new Error('Failed to fetch reports');
         return res.json();

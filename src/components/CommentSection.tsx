@@ -4,6 +4,8 @@ import { formatDistanceToNow } from 'date-fns';
 import { Send, Reply, CornerDownRight } from 'lucide-react';
 import { Link } from 'react-router-dom';
 
+const API_URL = "https://founder-feed-1.onrender.com";
+
 interface CommentSectionProps {
   postId: number;
   currentUser: User | null;
@@ -21,7 +23,7 @@ export default function CommentSection({ postId, currentUser }: CommentSectionPr
 
   const fetchComments = async () => {
     try {
-      const res = await fetch(`/api/posts/${postId}/comments`);
+      const res = await fetch(`${API_URL}/api/posts/${postId}/comments`);
       const contentType = res.headers.get('content-type');
       const isJson = contentType && contentType.includes('application/json');
 
@@ -49,7 +51,7 @@ export default function CommentSection({ postId, currentUser }: CommentSectionPr
     if (!newComment.trim()) return;
 
     try {
-      const res = await fetch(`/api/posts/${postId}/comments`, {
+      const res = await fetch(`${API_URL}/api/posts/${postId}/comments`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 
@@ -57,6 +59,7 @@ export default function CommentSection({ postId, currentUser }: CommentSectionPr
           parent_id: replyTo ? replyTo.id : null
         }),
       });
+
       if (res.ok) {
         setNewComment('');
         setReplyTo(null);

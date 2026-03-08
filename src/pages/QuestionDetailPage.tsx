@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { useParams, useNavigate, Link } from "react-router-dom";
 import { Loader2, ArrowLeft } from "lucide-react";
 
+const API_URL = "https://founder-feed-1.onrender.com";
+
 export default function QuestionDetailPage({ currentUser }: { currentUser: any }) {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -15,7 +17,7 @@ export default function QuestionDetailPage({ currentUser }: { currentUser: any }
 
   const fetchData = async () => {
     try {
-      const res = await fetch(`/api/questions/${id}`, {
+      const res = await fetch(`${API_URL}/api/questions/${id}`, {
         credentials: "include",
       });
       const data = await res.json();
@@ -38,7 +40,7 @@ export default function QuestionDetailPage({ currentUser }: { currentUser: any }
   const handleDeleteQuestion = async () => {
     if (!confirm("Delete this question?")) return;
 
-    const res = await fetch(`/api/questions/${id}`, {
+    const res = await fetch(`${API_URL}/api/questions/${id}`, {
       method: "DELETE",
       credentials: "include",
     });
@@ -52,7 +54,7 @@ export default function QuestionDetailPage({ currentUser }: { currentUser: any }
   const handleDeleteAnswer = async (answerId: number) => {
     if (!confirm("Delete this answer?")) return;
 
-    const res = await fetch(`/api/answers/${answerId}`, {
+    const res = await fetch(`${API_URL}/api/answers/${answerId}`, {
       method: "DELETE",
       credentials: "include",
     });
@@ -68,7 +70,7 @@ export default function QuestionDetailPage({ currentUser }: { currentUser: any }
   const handleEditAnswer = async (answerId: number) => {
     if (!editedContent.trim()) return;
 
-    const res = await fetch(`/api/answers/${answerId}`, {
+    const res = await fetch(`${API_URL}/api/answers/${answerId}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       credentials: "include",
@@ -93,7 +95,7 @@ export default function QuestionDetailPage({ currentUser }: { currentUser: any }
   // MARK BEST
   // -------------------------
   const handleMarkBest = async (answerId: number) => {
-    const res = await fetch(`/api/answers/${answerId}/best`, {
+    const res = await fetch(`${API_URL}/api/answers/${answerId}/best`, {
       method: "PUT",
       credentials: "include",
     });
@@ -108,7 +110,7 @@ export default function QuestionDetailPage({ currentUser }: { currentUser: any }
     e.preventDefault();
     if (!newAnswer.trim()) return;
 
-    const res = await fetch(`/api/questions/${id}/answers`, {
+    const res = await fetch(`${API_URL}/api/questions/${id}/answers`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "include",

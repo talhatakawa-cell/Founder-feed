@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { Loader2, MessageCircle } from "lucide-react";
+import { auth } from "../firebase";
 
 interface Question {
   id: number;
@@ -18,8 +19,17 @@ export default function QAPage({ currentUser }: { currentUser: any }) {
 
   const fetchQuestions = async () => {
     try {
-      const res = await fetch("/api/questions");
+      const user = auth.currentUser;
+      const token = user ? await user.getIdToken() : null;
+
+      const res = await fetch("https://founder-feed-1.onrender.com/api/questions", {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
       if (!res.ok) throw new Error("Failed to fetch questions");
+
       const data = await res.json();
       setQuestions(data);
     } catch (err: any) {

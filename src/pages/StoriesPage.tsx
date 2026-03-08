@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { Plus } from "lucide-react";
 import { User } from "../types";
+import { auth } from "../firebase";
 
 
 export default function StoriesPage({ currentUser }: { currentUser: User | null }) {
@@ -28,8 +29,15 @@ useEffect(() => {
 
   const fetchStories = async () => {
     try {
-      const res = await fetch("/api/stories", {
+
+      const user = auth.currentUser;
+      const token = user ? await user.getIdToken() : null;
+
+      const res = await fetch("https://founder-feed-1.onrender.com/api/stories", {
         credentials: "include",
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
       });
 
       if (!res.ok) {
@@ -52,9 +60,15 @@ useEffect(() => {
     e.preventDefault();
     e.stopPropagation();
 
-    const res = await fetch(`/api/stories/${id}/like`, {
+    const user = auth.currentUser;
+    const token = user ? await user.getIdToken() : null;
+
+    const res = await fetch(`https://founder-feed-1.onrender.com/api/stories/${id}/like`, {
       method: "POST",
       credentials: "include",
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
     });
 
     const data = await res.json();
@@ -79,9 +93,15 @@ useEffect(() => {
     e.preventDefault();
     e.stopPropagation();
 
-    await fetch(`/api/stories/${id}/report`, {
+    const user = auth.currentUser;
+    const token = user ? await user.getIdToken() : null;
+
+    await fetch(`https://founder-feed-1.onrender.com/api/stories/${id}/report`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: { 
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+      },
       credentials: "include",
       body: JSON.stringify({ reason: "Inappropriate content" }),
     });
@@ -96,9 +116,15 @@ useEffect(() => {
 
     if (!confirm("Delete this story?")) return;
 
-    await fetch(`/api/stories/${id}`, {
+    const user = auth.currentUser;
+    const token = user ? await user.getIdToken() : null;
+
+    await fetch(`https://founder-feed-1.onrender.com/api/stories/${id}`, {
       method: "DELETE",
       credentials: "include",
+      headers: {
+        Authorization: `Bearer ${token}`,
+      },
     });
 
     setStories((prev) => prev.filter((story) => story.id !== id));

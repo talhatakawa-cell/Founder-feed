@@ -1,6 +1,8 @@
 import { useEffect, useState } from "react";
 import { useParams, Link, useNavigate } from "react-router-dom";
 
+const API_URL = "https://founder-feed-1.onrender.com";
+
 export default function StoryDetailPage({ currentUser }: any) {
   const { id } = useParams();
   const navigate = useNavigate();
@@ -19,7 +21,7 @@ export default function StoryDetailPage({ currentUser }: any) {
   useEffect(() => {
     const fetchStory = async () => {
       try {
-        const res = await fetch(`/api/stories/${id}`, {
+        const res = await fetch(`${API_URL}/api/stories/${id}`, {
           credentials: "include",
         });
 
@@ -46,7 +48,7 @@ export default function StoryDetailPage({ currentUser }: any) {
   // 🔹 Fetch Comments
   const fetchComments = async () => {
     try {
-      const res = await fetch(`/api/stories/${id}/comments`, {
+      const res = await fetch(`${API_URL}/api/stories/${id}/comments`, {
         credentials: "include",
       });
       const data = await res.json();
@@ -58,7 +60,7 @@ export default function StoryDetailPage({ currentUser }: any) {
 
   // ❤️ Like
   const handleLike = async () => {
-    const res = await fetch(`/api/stories/${id}/like`, {
+    const res = await fetch(`${API_URL}/api/stories/${id}/like`, {
       method: "POST",
       credentials: "include",
     });
@@ -70,7 +72,7 @@ export default function StoryDetailPage({ currentUser }: any) {
   const handleComment = async () => {
     if (!newComment.trim()) return;
 
-    await fetch(`/api/stories/${id}/comments`, {
+    await fetch(`${API_URL}/api/stories/${id}/comments`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "include",
@@ -81,9 +83,9 @@ export default function StoryDetailPage({ currentUser }: any) {
     fetchComments();
   };
 
-  //  Report
+  // 🚩 Report
   const handleReport = async () => {
-    await fetch(`/api/stories/${id}/report`, {
+    await fetch(`${API_URL}/api/stories/${id}/report`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       credentials: "include",
@@ -93,9 +95,9 @@ export default function StoryDetailPage({ currentUser }: any) {
     alert("Story reported");
   };
 
-  //  Save Edit
+  // ✏️ Save Edit
   const handleSaveEdit = async () => {
-    await fetch(`/api/stories/${id}`, {
+    await fetch(`${API_URL}/api/stories/${id}`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       credentials: "include",
@@ -110,7 +112,7 @@ export default function StoryDetailPage({ currentUser }: any) {
   const handleDelete = async () => {
     if (!confirm("Delete this story?")) return;
 
-    await fetch(`/api/stories/${id}`, {
+    await fetch(`${API_URL}/api/stories/${id}`, {
       method: "DELETE",
       credentials: "include",
     });
@@ -180,7 +182,7 @@ export default function StoryDetailPage({ currentUser }: any) {
             </button>
 
             <button onClick={handleReport} className="text-yellow-500">
-               Report
+              🚩 Report
             </button>
 
             {currentUser?.id === story.user_id && (
@@ -189,7 +191,7 @@ export default function StoryDetailPage({ currentUser }: any) {
                   onClick={() => setEditing(true)}
                   className="text-green-400"
                 >
-                   Edit
+                  ✏️ Edit
                 </button>
 
                 <button
