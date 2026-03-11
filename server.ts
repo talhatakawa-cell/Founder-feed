@@ -11,14 +11,25 @@ import cors from "cors";
 import admin from "firebase-admin";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const db = new Database("founderfeed.db");
+
+const DB_PATH =
+  process.env.DB_PATH || path.join(__dirname, "founderfeed.db");
+const db = new Database(DB_PATH);
 db.pragma("foreign_keys = ON");
 
 // Firebase Admin
 if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.applicationDefault(),
-  });
+  const serviceAccountJson = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+
+  if (serviceAccountJson) {
+    admin.initializeApp({
+      credential: admin.credential.cert(JSON.parse(serviceAccountJson)),
+    });
+  } else {
+    admin.initializeApp({
+      credential: admin.credential.applicationDefault(),
+    });
+  }
 }
 
 // Patch BigInt to work with JSON.stringify
@@ -29,13 +40,14 @@ if (!admin.apps.length) {
 // Ensure uploads directory exists
 const uploadDir = path.join(__dirname, "uploads");
 if (!fs.existsSync(uploadDir)) {
-  fs.mkdirSync(uploadDir);
+  fs.mkdirSync(uploadDir, { recursive: true });
 }
 
 // Multer config
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, uploadDir),
-  filename: (req, file, cb) => cb(null, Date.now() + "-" + file.originalname),
+  destination: (_req, _file, cb) => cb(null, uploadDir),
+  filename: (_req, file, cb) =>
+    cb(null, `${Date.now()}-${file.originalname}`),
 });
 
 const upload = multer({
@@ -276,19 +288,80 @@ db.exec(`
 // Migrations
 try {
   db.exec("ALTER TABLE posts ADD COLUMN media_url TEXT;");
-} catch (e) {}
+} catch {}
 try {
   db.exec("ALTER TABLE posts ADD COLUMN media_type TEXT;");
-} catch (e) {}
+} catch {}
 try {
   db.exec("ALTER TABLE users ADD COLUMN profile_picture TEXT;");
-} catch (e) {}
+} catch {}
 try {
   db.exec("ALTER TABLE comments ADD COLUMN parent_id INTEGER;");
-} catch (e) {}
+} catch {}
 try {
   db.exec("ALTER TABLE product_comments ADD COLUMN parent_id INTEGER;");
-} catch (e) {}
+} catch {}
+
+type AuthRequest = express.Request & {
+  user?: {
+    id: number;
+    email: string;
+    firebase_uid?: string;
+  };
+};
+
+function getUserById(id: number) {
+  return db
+    .prepare(
+      "SELECT id, email, name, startup_name, role, bio, website, profile_picture, location FROM users WHERE id = ?"
+    )
+    .get(id);
+}
+
+function upsertUserFromFirebase(decoded: admin.auth.DecodedIdToken) {
+  const email = decoded.email;
+  if (!email) {
+    throw new Error("Firebase token does not include email");
+  }
+
+  let user: any = db.prepare("SELECT * FROM users WHERE email = ?").get(email);
+
+  if (!user) {
+    const result = db
+      .prepare(
+        `
+        INSERT INTO users (email, password, name, startup_name, role, profile_picture)
+        VALUES (?, '', ?, '', 'founder', ?)
+      `
+      )
+      .run(
+        email,
+        decoded.name || "User",
+        typeof decoded.picture === "string" ? decoded.picture : null
+      );
+
+    user = db
+      .prepare("SELECT * FROM users WHERE id = ?")
+      .get(Number(result.lastInsertRowid));
+  } else {
+    const nextName = user.name || decoded.name || "User";
+    const nextProfilePicture =
+      user.profile_picture ||
+      (typeof decoded.picture === "string" ? decoded.picture : null);
+
+    db.prepare(
+      `
+      UPDATE users
+      SET name = ?, profile_picture = COALESCE(?, profile_picture)
+      WHERE id = ?
+    `
+    ).run(nextName, nextProfilePicture, user.id);
+
+    user = db.prepare("SELECT * FROM users WHERE id = ?").get(user.id);
+  }
+
+  return user;
+}
 
 async function startServer() {
   const app = express();
@@ -304,7 +377,7 @@ async function startServer() {
         }
         return callback(new Error("Not allowed by CORS"));
       },
-      methods: ["GET", "POST"],
+      methods: ["GET", "POST", "PUT", "DELETE"],
       credentials: true,
     },
   });
@@ -324,10 +397,11 @@ async function startServer() {
   );
 
   app.use(express.json());
+  app.use(express.urlencoded({ extended: true }));
   app.use("/uploads", express.static(uploadDir));
 
   // Request Logger
-  app.use((req, res, next) => {
+  app.use((req, _res, next) => {
     if (
       !req.url.startsWith("/@vite") &&
       !req.url.startsWith("/src") &&
@@ -338,7 +412,11 @@ async function startServer() {
     next();
   });
 
-  const authenticateToken = async (req: any, res: any, next: any) => {
+  const authenticateToken = async (
+    req: AuthRequest,
+    res: express.Response,
+    next: express.NextFunction
+  ) => {
     try {
       const authHeader = req.headers.authorization;
 
@@ -347,83 +425,94 @@ async function startServer() {
       }
 
       const token = authHeader.split("Bearer ")[1];
-
       const decoded = await admin.auth().verifyIdToken(token);
-
-      let user: any = db
-        .prepare(
-          `
-          SELECT * FROM users WHERE email = ?
-        `
-        )
-        .get(decoded.email);
-
-      if (!user) {
-        const result = db
-          .prepare(
-            `
-            INSERT INTO users (email,password,name,startup_name,role)
-            VALUES (?, '', ?, '', 'founder')
-          `
-          )
-          .run(decoded.email, decoded.name || "User");
-
-        user = {
-          id: Number(result.lastInsertRowid),
-          email: decoded.email,
-          name: decoded.name || "User",
-        };
-      }
+      const user = upsertUserFromFirebase(decoded);
 
       req.user = {
-        id: user.id,
+        id: Number(user.id),
         email: user.email,
+        firebase_uid: decoded.uid,
       };
 
       next();
     } catch (err) {
       console.error("Auth error:", err);
-      res.status(401).json({ error: "Invalid token" });
+      return res.status(401).json({ error: "Invalid token" });
     }
   };
 
   const apiRouter = express.Router();
 
-  // Auth/Profile
-  apiRouter.get("/auth/me", authenticateToken, (req: any, res) => {
+  apiRouter.get("/health", (_req, res) => {
+    res.json({ ok: true });
+  });
+
+  // Firebase bootstrap after signup/login
+  apiRouter.post("/auth/bootstrap", authenticateToken, (req: AuthRequest, res) => {
     try {
-      const user: any = db
-        .prepare(
-          "SELECT id, email, name, startup_name, role, bio, website, profile_picture, location FROM users WHERE id = ?"
-        )
-        .get(req.user.id);
+      const { name, startup_name, role } = req.body;
+      const safeName = String(name || "").trim();
+      const safeStartupName = String(startup_name || "").trim();
+      const safeRole = String(role || "").trim();
 
-      if (!user) return res.status(404).json({ error: "User not found" });
+      db.prepare(
+        `
+        UPDATE users
+        SET
+          name = CASE WHEN ? != '' THEN ? ELSE name END,
+          startup_name = CASE WHEN ? != '' THEN ? ELSE startup_name END,
+          role = CASE WHEN ? != '' THEN ? ELSE role END
+        WHERE id = ?
+      `
+      ).run(
+        safeName,
+        safeName,
+        safeStartupName,
+        safeStartupName,
+        safeRole,
+        safeRole,
+        req.user!.id
+      );
 
-      res.json(user);
-    } catch (error) {
-      res.status(500).json({ error: "Failed to fetch user profile" });
+      const user = getUserById(req.user!.id);
+      return res.json(user);
+    } catch (error: any) {
+      console.error("POST /api/auth/bootstrap error:", error);
+      return res.status(500).json({ error: "Failed to bootstrap user" });
     }
   });
 
-  apiRouter.get("/profile", authenticateToken, (req: any, res) => {
+  // Auth/Profile
+  apiRouter.get("/auth/me", authenticateToken, (req: AuthRequest, res) => {
     try {
-      const user: any = db
-        .prepare(
-          "SELECT id, email, name, startup_name, role, bio, website, profile_picture, location FROM users WHERE id = ?"
-        )
-        .get(req.user.id);
+      const user: any = getUserById(req.user!.id);
 
-      if (!user) return res.status(404).json({ error: "User not found" });
+      if (!user) {
+        return res.status(404).json({ error: "User not found" });
+      }
 
-      res.json(user);
-    } catch (error) {
-      res.status(500).json({ error: "Failed to fetch profile" });
+      return res.json(user);
+    } catch {
+      return res.status(500).json({ error: "Failed to fetch user profile" });
+    }
+  });
+
+  apiRouter.get("/profile", authenticateToken, (req: AuthRequest, res) => {
+    try {
+      const user: any = getUserById(req.user!.id);
+
+      if (!user) {
+        return res.status(404).json({ error: "User not found" });
+      }
+
+      return res.json(user);
+    } catch {
+      return res.status(500).json({ error: "Failed to fetch profile" });
     }
   });
 
   // Stories
-  apiRouter.post("/stories", authenticateToken, (req: any, res) => {
+  apiRouter.post("/stories", authenticateToken, (req: AuthRequest, res) => {
     try {
       const { title, content } = req.body;
 
@@ -445,9 +534,9 @@ async function startServer() {
         VALUES (?, ?, ?)
       `);
 
-      const result = stmt.run(req.user.id, title.trim(), content.trim());
+      const result = stmt.run(req.user!.id, title.trim(), content.trim());
 
-      res.json({
+      return res.json({
         id: Number(result.lastInsertRowid),
         title: title.trim(),
         content: content.trim(),
@@ -455,13 +544,14 @@ async function startServer() {
       });
     } catch (error: any) {
       console.error("Story creation error:", error);
-      res.status(500).json({ error: "Failed to create story" });
+      return res.status(500).json({ error: "Failed to create story" });
     }
   });
 
-  apiRouter.get("/stories", authenticateToken, (req: any, res) => {
+  apiRouter.get("/stories", authenticateToken, (req: AuthRequest, res) => {
     try {
-      const stories = db.prepare(`
+      const stories = db
+        .prepare(`
         SELECT 
           s.*,
           u.name as author_name,
@@ -472,40 +562,43 @@ async function startServer() {
         FROM stories s
         JOIN users u ON s.user_id = u.id
         ORDER BY s.created_at DESC
-      `).all(req.user.id);
+      `)
+        .all(req.user!.id);
 
-      res.json(stories);
+      return res.json(stories);
     } catch (error: any) {
       console.error("Fetch stories error:", error);
-      res.status(500).json({ error: "Failed to fetch stories" });
+      return res.status(500).json({ error: "Failed to fetch stories" });
     }
   });
 
-  apiRouter.post("/stories/:id/like", authenticateToken, (req: any, res) => {
+  apiRouter.post("/stories/:id/like", authenticateToken, (req: AuthRequest, res) => {
     try {
       db.prepare("INSERT INTO story_likes (user_id, story_id) VALUES (?, ?)")
-        .run(req.user.id, req.params.id);
-      res.json({ liked: true });
+        .run(req.user!.id, req.params.id);
+      return res.json({ liked: true });
     } catch {
       db.prepare("DELETE FROM story_likes WHERE user_id = ? AND story_id = ?")
-        .run(req.user.id, req.params.id);
-      res.json({ liked: false });
+        .run(req.user!.id, req.params.id);
+      return res.json({ liked: false });
     }
   });
 
-  apiRouter.get("/stories/:id/comments", authenticateToken, (req: any, res) => {
-    const comments = db.prepare(`
+  apiRouter.get("/stories/:id/comments", authenticateToken, (_req: AuthRequest, res) => {
+    const comments = db
+      .prepare(`
       SELECT c.*, u.name as author_name
       FROM story_comments c
       JOIN users u ON c.user_id = u.id
       WHERE c.story_id = ?
       ORDER BY c.created_at ASC
-    `).all(req.params.id);
+    `)
+      .all(_req.params.id);
 
-    res.json(comments);
+    return res.json(comments);
   });
 
-  apiRouter.post("/stories/:id/comments", authenticateToken, (req: any, res) => {
+  apiRouter.post("/stories/:id/comments", authenticateToken, (req: AuthRequest, res) => {
     try {
       const { content } = req.body;
 
@@ -513,64 +606,71 @@ async function startServer() {
         return res.status(400).json({ error: "Comment is required" });
       }
 
-      const result = db.prepare(`
+      const result = db
+        .prepare(`
         INSERT INTO story_comments (user_id, story_id, content)
         VALUES (?, ?, ?)
-      `).run(req.user.id, req.params.id, content.trim());
+      `)
+        .run(req.user!.id, req.params.id, content.trim());
 
-      res.json({
+      return res.json({
         id: Number(result.lastInsertRowid),
         content: content.trim(),
       });
     } catch (error: any) {
       console.error("Create story comment error:", error);
-      res.status(500).json({ error: "Failed to create comment" });
+      return res.status(500).json({ error: "Failed to create comment" });
     }
   });
 
-  apiRouter.post("/stories/:id/report", authenticateToken, (req: any, res) => {
+  apiRouter.post("/stories/:id/report", authenticateToken, (req: AuthRequest, res) => {
     const { reason } = req.body;
 
     db.prepare(`
       INSERT INTO story_reports (user_id, story_id, reason)
       VALUES (?, ?, ?)
-    `).run(req.user.id, req.params.id, reason);
+    `).run(req.user!.id, req.params.id, reason);
 
-    res.json({ reported: true });
+    return res.json({ reported: true });
   });
 
-  apiRouter.put("/stories/:id", authenticateToken, (req: any, res) => {
+  apiRouter.put("/stories/:id", authenticateToken, (req: AuthRequest, res) => {
     const { title, content } = req.body;
 
-    const result = db.prepare(`
+    const result = db
+      .prepare(`
       UPDATE stories
       SET title = ?, content = ?
       WHERE id = ? AND user_id = ?
-    `).run(title, content, req.params.id, req.user.id);
+    `)
+      .run(title, content, req.params.id, req.user!.id);
 
     if (result.changes === 0) {
       return res.status(403).json({ error: "Unauthorized" });
     }
 
-    res.json({ updated: true });
+    return res.json({ updated: true });
   });
 
-  apiRouter.delete("/stories/:id", authenticateToken, (req: any, res) => {
-    const result = db.prepare(`
+  apiRouter.delete("/stories/:id", authenticateToken, (req: AuthRequest, res) => {
+    const result = db
+      .prepare(`
       DELETE FROM stories
       WHERE id = ? AND user_id = ?
-    `).run(req.params.id, req.user.id);
+    `)
+      .run(req.params.id, req.user!.id);
 
     if (result.changes === 0) {
       return res.status(403).json({ error: "Unauthorized" });
     }
 
-    res.json({ deleted: true });
+    return res.json({ deleted: true });
   });
 
-  apiRouter.get("/stories/:id", authenticateToken, (req: any, res) => {
+  apiRouter.get("/stories/:id", authenticateToken, (req: AuthRequest, res) => {
     try {
-      const story = db.prepare(`
+      const story = db
+        .prepare(`
         SELECT 
           s.*,
           u.name as author_name,
@@ -580,26 +680,28 @@ async function startServer() {
         FROM stories s
         JOIN users u ON s.user_id = u.id
         WHERE s.id = ?
-      `).get(req.user.id, req.params.id);
+      `)
+        .get(req.user!.id, req.params.id);
 
       if (!story) {
         return res.status(404).json({ error: "Story not found" });
       }
 
-      res.json(story);
+      return res.json(story);
     } catch (error: any) {
       console.error("Fetch single story error:", error);
-      res.status(500).json({ error: "Failed to fetch story" });
+      return res.status(500).json({ error: "Failed to fetch story" });
     }
   });
 
   // Posts
-  apiRouter.get("/posts", authenticateToken, (req: any, res) => {
+  apiRouter.get("/posts", authenticateToken, (req: AuthRequest, res) => {
     try {
       const limit = parseInt(req.query.limit as string) || 10;
       const offset = parseInt(req.query.offset as string) || 0;
 
-      const posts = db.prepare(`
+      const posts = db
+        .prepare(`
         SELECT p.*, u.name as author_name, u.startup_name, u.role, u.profile_picture as author_avatar,
         (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as likes_count,
         (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comments_count,
@@ -609,20 +711,22 @@ async function startServer() {
         JOIN users u ON p.user_id = u.id
         ORDER BY p.created_at DESC
         LIMIT ? OFFSET ?
-      `).all(req.user.id, req.user.id, limit, offset);
+      `)
+        .all(req.user!.id, req.user!.id, limit, offset);
 
-      res.json(posts);
+      return res.json(posts);
     } catch (error: any) {
       console.error("Fetch posts error:", error);
-      res.status(500).json({ error: "Failed to fetch posts" });
+      return res.status(500).json({ error: "Failed to fetch posts" });
     }
   });
 
-  apiRouter.get("/posts/user/:userId", authenticateToken, (req: any, res) => {
+  apiRouter.get("/posts/user/:userId", authenticateToken, (req: AuthRequest, res) => {
     try {
       const userId = Number(req.params.userId);
 
-      const posts = db.prepare(`
+      const posts = db
+        .prepare(`
         SELECT p.*, u.name as author_name, u.startup_name, u.role, u.profile_picture as author_avatar,
         (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as likes_count,
         (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comments_count,
@@ -632,56 +736,69 @@ async function startServer() {
         JOIN users u ON p.user_id = u.id
         WHERE p.user_id = ?
         ORDER BY p.created_at DESC
-      `).all(req.user.id, req.user.id, userId);
+      `)
+        .all(req.user!.id, req.user!.id, userId);
 
-      res.json(posts);
+      return res.json(posts);
     } catch (error: any) {
       console.error("Fetch user posts error:", error);
-      res.status(500).json({ error: "Failed to fetch user posts" });
+      return res.status(500).json({ error: "Failed to fetch user posts" });
     }
   });
 
-  apiRouter.post("/posts", authenticateToken, upload.single("media"), (req: any, res) => {
-    try {
-      const { content } = req.body;
-      const media_url = req.file ? `/uploads/${req.file.filename}` : null;
-      const media_type = req.file
-        ? req.file.mimetype.startsWith("video")
-          ? "video"
-          : "image"
-        : null;
+  apiRouter.post(
+    "/posts",
+    authenticateToken,
+    upload.single("media"),
+    (req: AuthRequest & { file?: Express.Multer.File }, res) => {
+      try {
+        const { content } = req.body;
+        const media_url = req.file ? `/uploads/${req.file.filename}` : null;
+        const media_type = req.file
+          ? req.file.mimetype.startsWith("video")
+            ? "video"
+            : "image"
+          : null;
 
-      if ((!content || content.trim().length === 0) && !media_url) {
-        return res.status(400).json({ error: "Content or media is required" });
+        if ((!content || content.trim().length === 0) && !media_url) {
+          return res.status(400).json({ error: "Content or media is required" });
+        }
+
+        if (content && content.length > 500) {
+          return res
+            .status(400)
+            .json({ error: "Content too long (max 500 chars)" });
+        }
+
+        const finalContent = content || "";
+        const stmt = db.prepare(
+          "INSERT INTO posts (user_id, content, media_url, media_type) VALUES (?, ?, ?, ?)"
+        );
+        const result = stmt.run(
+          req.user!.id,
+          finalContent,
+          media_url,
+          media_type
+        );
+
+        return res.json({
+          id: Number(result.lastInsertRowid),
+          content: finalContent,
+          user_id: req.user!.id,
+          media_url,
+          media_type,
+        });
+      } catch (error: any) {
+        console.error("Post creation error:", error);
+        return res.status(500).json({ error: "Database error: " + error.message });
       }
-
-      if (content && content.length > 500) {
-        return res.status(400).json({ error: "Content too long (max 500 chars)" });
-      }
-
-      const finalContent = content || "";
-      const stmt = db.prepare(
-        "INSERT INTO posts (user_id, content, media_url, media_type) VALUES (?, ?, ?, ?)"
-      );
-      const result = stmt.run(req.user.id, finalContent, media_url, media_type);
-
-      res.json({
-        id: Number(result.lastInsertRowid),
-        content: finalContent,
-        user_id: req.user.id,
-        media_url,
-        media_type,
-      });
-    } catch (error: any) {
-      console.error("Post creation error:", error);
-      res.status(500).json({ error: "Database error: " + error.message });
     }
-  });
+  );
 
-  apiRouter.delete("/posts/:id", authenticateToken, (req: any, res) => {
+  apiRouter.delete("/posts/:id", authenticateToken, (req: AuthRequest, res) => {
     try {
       const postId = Number(req.params.id);
-      const userId = Number(req.user.id);
+      const userId = Number(req.user!.id);
 
       if (isNaN(postId) || isNaN(userId)) {
         return res.status(400).json({ error: "Invalid ID format" });
@@ -694,7 +811,9 @@ async function startServer() {
       }
 
       if (post.user_id !== userId) {
-        return res.status(403).json({ error: "Unauthorized: You are not the author of this post" });
+        return res.status(403).json({
+          error: "Unauthorized: You are not the author of this post",
+        });
       }
 
       const deleteLikes = db.prepare("DELETE FROM likes WHERE post_id = ?");
@@ -711,14 +830,16 @@ async function startServer() {
 
       transaction();
 
-      res.json({ message: "Post deleted successfully" });
+      return res.json({ message: "Post deleted successfully" });
     } catch (error: any) {
       console.error("Delete post error:", error);
-      res.status(500).json({ error: "Failed to delete post: " + error.message });
+      return res
+        .status(500)
+        .json({ error: "Failed to delete post: " + error.message });
     }
   });
 
-  apiRouter.put("/posts/:id", authenticateToken, (req: any, res) => {
+  apiRouter.put("/posts/:id", authenticateToken, (req: AuthRequest, res) => {
     try {
       const { content } = req.body;
 
@@ -731,159 +852,189 @@ async function startServer() {
       }
 
       const postId = Number(req.params.id);
-      const userId = Number(req.user.id);
+      const userId = Number(req.user!.id);
 
-      const stmt = db.prepare("UPDATE posts SET content = ? WHERE id = ? AND user_id = ?");
+      const stmt = db.prepare(
+        "UPDATE posts SET content = ? WHERE id = ? AND user_id = ?"
+      );
       const result = stmt.run(content, postId, userId);
 
       if (result.changes === 0) {
         return res.status(403).json({ error: "Unauthorized or not found" });
       }
 
-      res.json({ message: "Post updated", content });
+      return res.json({ message: "Post updated", content });
     } catch (error: any) {
-      res.status(500).json({ error: "Database error: " + error.message });
+      return res.status(500).json({ error: "Database error: " + error.message });
     }
   });
 
   // Post interactions
-  apiRouter.post("/posts/:id/like", authenticateToken, (req: any, res) => {
+  apiRouter.post("/posts/:id/like", authenticateToken, (req: AuthRequest, res) => {
     try {
       db.prepare("INSERT INTO likes (user_id, post_id) VALUES (?, ?)")
-        .run(req.user.id, req.params.id);
-      res.json({ liked: true });
-    } catch (err) {
+        .run(req.user!.id, req.params.id);
+      return res.json({ liked: true });
+    } catch {
       db.prepare("DELETE FROM likes WHERE user_id = ? AND post_id = ?")
-        .run(req.user.id, req.params.id);
-      res.json({ liked: false });
+        .run(req.user!.id, req.params.id);
+      return res.json({ liked: false });
     }
   });
 
-  apiRouter.get("/posts/:id/comments", authenticateToken, (req: any, res) => {
+  apiRouter.get("/posts/:id/comments", authenticateToken, (req: AuthRequest, res) => {
     try {
-      const comments = db.prepare(`
+      const comments = db
+        .prepare(`
         SELECT c.*, u.name as author_name, u.startup_name
         FROM comments c
         JOIN users u ON c.user_id = u.id
         WHERE c.post_id = ?
         ORDER BY c.created_at ASC
-      `).all(req.params.id);
+      `)
+        .all(req.params.id);
 
-      res.json(comments);
+      return res.json(comments);
     } catch (error: any) {
       console.error("Fetch comments error:", error);
-      res.status(500).json({ error: "Failed to fetch comments" });
+      return res.status(500).json({ error: "Failed to fetch comments" });
     }
   });
 
-  apiRouter.post("/posts/:id/comments", authenticateToken, (req: any, res) => {
+  apiRouter.post("/posts/:id/comments", authenticateToken, (req: AuthRequest, res) => {
     try {
       const { content, parent_id } = req.body;
       const stmt = db.prepare(
         "INSERT INTO comments (user_id, post_id, content, parent_id) VALUES (?, ?, ?, ?)"
       );
-      const result = stmt.run(req.user.id, req.params.id, content, parent_id || null);
-      res.json({ id: Number(result.lastInsertRowid), content, parent_id });
+      const result = stmt.run(
+        req.user!.id,
+        req.params.id,
+        content,
+        parent_id || null
+      );
+      return res.json({ id: Number(result.lastInsertRowid), content, parent_id });
     } catch (error: any) {
       console.error("Create comment error:", error);
-      res.status(500).json({ error: "Failed to create comment" });
+      return res.status(500).json({ error: "Failed to create comment" });
     }
   });
 
-  apiRouter.post("/posts/:id/report", authenticateToken, (req: any, res) => {
+  apiRouter.post("/posts/:id/report", authenticateToken, (req: AuthRequest, res) => {
     try {
       const { reason } = req.body;
       db.prepare("INSERT INTO reports (user_id, post_id, reason) VALUES (?, ?, ?)")
-        .run(req.user.id, req.params.id, reason);
-      res.json({ message: "Reported" });
-    } catch (error: any) {
-      res.status(500).json({ error: "Failed to report" });
+        .run(req.user!.id, req.params.id, reason);
+      return res.json({ message: "Reported" });
+    } catch {
+      return res.status(500).json({ error: "Failed to report" });
     }
   });
 
   // Profile
-  apiRouter.put("/profile", authenticateToken, upload.single("avatar"), (req: any, res) => {
-    try {
-      const { name, startup_name, role, bio, website, location } = req.body;
-      let profile_picture = req.body.profile_picture;
+  apiRouter.put(
+    "/profile",
+    authenticateToken,
+    upload.single("avatar"),
+    (req: AuthRequest & { file?: Express.Multer.File }, res) => {
+      try {
+        const { name, startup_name, role, bio, website, location } = req.body;
+        let profile_picture = req.body.profile_picture;
 
-      if (req.file) {
-        profile_picture = `/uploads/${req.file.filename}`;
-      }
+        if (req.file) {
+          profile_picture = `/uploads/${req.file.filename}`;
+        }
 
-      const stmt = db.prepare(`
+        const stmt = db.prepare(`
         UPDATE users
         SET name = ?, startup_name = ?, role = ?, bio = ?, website = ?, location = ?, profile_picture = ?
         WHERE id = ?
       `);
 
-      stmt.run(name, startup_name, role, bio, website, location, profile_picture, req.user.id);
+        stmt.run(
+          name,
+          startup_name,
+          role,
+          bio,
+          website,
+          location,
+          profile_picture,
+          req.user!.id
+        );
 
-      res.json({ message: "Profile updated", profile_picture });
-    } catch (error: any) {
-      res.status(500).json({ error: "Failed to update profile" });
+        return res.json({ message: "Profile updated", profile_picture });
+      } catch {
+        return res.status(500).json({ error: "Failed to update profile" });
+      }
     }
-  });
+  );
 
-  apiRouter.get("/users/suggested", authenticateToken, (req: any, res) => {
+  apiRouter.get("/users/suggested", authenticateToken, (req: AuthRequest, res) => {
     try {
-      const users = db.prepare(`
+      const users = db
+        .prepare(`
         SELECT id, name, startup_name, role, profile_picture
         FROM users
         WHERE id != ?
         AND id NOT IN (SELECT target_id FROM co_builders WHERE user_id = ?)
         ORDER BY RANDOM()
         LIMIT 5
-      `).all(req.user.id, req.user.id);
+      `)
+        .all(req.user!.id, req.user!.id);
 
-      res.json(users);
+      return res.json(users);
     } catch (error: any) {
       console.error("Fetch suggested users error:", error);
-      res.status(500).json({ error: "Failed to fetch suggestions" });
+      return res.status(500).json({ error: "Failed to fetch suggestions" });
     }
   });
 
-  apiRouter.get("/users/:id", authenticateToken, (req: any, res) => {
+  apiRouter.get("/users/:id", authenticateToken, (req: AuthRequest, res) => {
     try {
-      const user: any = db.prepare(`
+      const user: any = db
+        .prepare(`
         SELECT id, name, startup_name, role, bio, website, profile_picture, location,
         (SELECT COUNT(*) FROM co_builders WHERE target_id = users.id) as co_builders_count,
         (SELECT COUNT(*) FROM co_builders WHERE user_id = users.id) as co_building_count,
         (SELECT 1 FROM co_builders WHERE user_id = ? AND target_id = users.id) as is_co_building
         FROM users WHERE id = ?
-      `).get(req.user.id, req.params.id);
+      `)
+        .get(req.user!.id, req.params.id);
 
-      if (!user) return res.status(404).json({ error: "User not found" });
+      if (!user) {
+        return res.status(404).json({ error: "User not found" });
+      }
 
-      res.json(user);
-    } catch (error: any) {
-      res.status(500).json({ error: "Failed to fetch user" });
+      return res.json(user);
+    } catch {
+      return res.status(500).json({ error: "Failed to fetch user" });
     }
   });
 
-  apiRouter.post("/users/:id/co-build", authenticateToken, (req: any, res) => {
+  apiRouter.post("/users/:id/co-build", authenticateToken, (req: AuthRequest, res) => {
     try {
       const targetId = req.params.id;
 
-      if (req.user.id == targetId) {
+      if (req.user!.id == Number(targetId)) {
         return res.status(400).json({ error: "You cannot co-build with yourself" });
       }
 
       db.prepare("INSERT INTO co_builders (user_id, target_id) VALUES (?, ?)")
-        .run(req.user.id, targetId);
+        .run(req.user!.id, targetId);
 
-      res.json({ co_building: true });
-    } catch (err) {
+      return res.json({ co_building: true });
+    } catch {
       db.prepare("DELETE FROM co_builders WHERE user_id = ? AND target_id = ?")
-        .run(req.user.id, req.params.id);
-      res.json({ co_building: false });
+        .run(req.user!.id, req.params.id);
+      return res.json({ co_building: false });
     }
   });
 
   // Products
-  apiRouter.get("/products", authenticateToken, (req: any, res) => {
+  apiRouter.get("/products", authenticateToken, (req: AuthRequest, res) => {
     try {
-      const products = db.prepare(`
+      const products = db
+        .prepare(`
         SELECT p.*, u.name as founder_name, u.profile_picture as founder_avatar,
         (SELECT COUNT(*) FROM product_likes WHERE product_id = p.id) as likes_count,
         (SELECT COUNT(*) FROM product_comments WHERE product_id = p.id) as comments_count,
@@ -891,118 +1042,138 @@ async function startServer() {
         FROM products p
         JOIN users u ON p.user_id = u.id
         ORDER BY p.created_at DESC
-      `).all(req.user.id);
+      `)
+        .all(req.user!.id);
 
-      res.json(products);
+      return res.json(products);
     } catch (error: any) {
       console.error("Fetch products error:", error);
-      res.status(500).json({ error: "Failed to fetch products" });
+      return res.status(500).json({ error: "Failed to fetch products" });
     }
   });
 
-  apiRouter.post("/products", authenticateToken, upload.single("image"), (req: any, res) => {
-    try {
-      const { name, problem_solved, website, short_description } = req.body;
-      const image_url = req.file ? `/uploads/${req.file.filename}` : null;
+  apiRouter.post(
+    "/products",
+    authenticateToken,
+    upload.single("image"),
+    (req: AuthRequest & { file?: Express.Multer.File }, res) => {
+      try {
+        const { name, problem_solved, website, short_description } = req.body;
+        const image_url = req.file ? `/uploads/${req.file.filename}` : null;
 
-      if (!name || !problem_solved || !website || !short_description) {
-        return res.status(400).json({ error: "Missing required fields" });
-      }
+        if (!name || !problem_solved || !website || !short_description) {
+          return res.status(400).json({ error: "Missing required fields" });
+        }
 
-      const stmt = db.prepare(`
+        const stmt = db.prepare(`
         INSERT INTO products (user_id, name, problem_solved, website, short_description, image_url)
         VALUES (?, ?, ?, ?, ?, ?)
       `);
 
-      const result = stmt.run(
-        req.user.id,
-        name,
-        problem_solved,
-        website,
-        short_description,
-        image_url
-      );
+        const result = stmt.run(
+          req.user!.id,
+          name,
+          problem_solved,
+          website,
+          short_description,
+          image_url
+        );
 
-      res.json({
-        id: Number(result.lastInsertRowid),
-        name,
-        problem_solved,
-        website,
-        short_description,
-        image_url,
-      });
-    } catch (error: any) {
-      console.error("Product creation error:", error);
-      res.status(500).json({ error: "Failed to launch product" });
+        return res.json({
+          id: Number(result.lastInsertRowid),
+          name,
+          problem_solved,
+          website,
+          short_description,
+          image_url,
+        });
+      } catch (error: any) {
+        console.error("Product creation error:", error);
+        return res.status(500).json({ error: "Failed to launch product" });
+      }
     }
-  });
+  );
 
-  apiRouter.post("/products/:id/like", authenticateToken, (req: any, res) => {
+  apiRouter.post("/products/:id/like", authenticateToken, (req: AuthRequest, res) => {
     try {
       const productId = req.params.id;
-      const userId = req.user.id;
+      const userId = req.user!.id;
 
       try {
         db.prepare("INSERT INTO product_likes (user_id, product_id) VALUES (?, ?)")
           .run(userId, productId);
-        res.json({ liked: true });
-      } catch (err) {
+        return res.json({ liked: true });
+      } catch {
         db.prepare("DELETE FROM product_likes WHERE user_id = ? AND product_id = ?")
           .run(userId, productId);
-        res.json({ liked: false });
+        return res.json({ liked: false });
       }
-    } catch (error: any) {
-      res.status(500).json({ error: "Failed to toggle like" });
+    } catch {
+      return res.status(500).json({ error: "Failed to toggle like" });
     }
   });
 
-  apiRouter.get("/products/:id/comments", authenticateToken, (req: any, res) => {
+  apiRouter.get("/products/:id/comments", authenticateToken, (req: AuthRequest, res) => {
     try {
-      const comments = db.prepare(`
+      const comments = db
+        .prepare(`
         SELECT c.*, u.name as author_name, u.profile_picture as author_avatar
         FROM product_comments c
         JOIN users u ON c.user_id = u.id
         WHERE c.product_id = ?
         ORDER BY c.created_at ASC
-      `).all(req.params.id);
+      `)
+        .all(req.params.id);
 
-      res.json(comments);
-    } catch (error: any) {
-      res.status(500).json({ error: "Failed to fetch comments" });
+      return res.json(comments);
+    } catch {
+      return res.status(500).json({ error: "Failed to fetch comments" });
     }
   });
 
-  apiRouter.post("/products/:id/comments", authenticateToken, (req: any, res) => {
+  apiRouter.post("/products/:id/comments", authenticateToken, (req: AuthRequest, res) => {
     try {
       const { content, parent_id } = req.body;
       const stmt = db.prepare(
         "INSERT INTO product_comments (user_id, product_id, content, parent_id) VALUES (?, ?, ?, ?)"
       );
-      const result = stmt.run(req.user.id, req.params.id, content, parent_id || null);
-      res.json({ id: Number(result.lastInsertRowid), content, parent_id });
-    } catch (error: any) {
-      res.status(500).json({ error: "Failed to add comment" });
+      const result = stmt.run(
+        req.user!.id,
+        req.params.id,
+        content,
+        parent_id || null
+      );
+      return res.json({ id: Number(result.lastInsertRowid), content, parent_id });
+    } catch {
+      return res.status(500).json({ error: "Failed to add comment" });
     }
   });
 
-  apiRouter.delete("/products/:id/comments/:commentId", authenticateToken, (req: any, res) => {
-    try {
-      const { commentId } = req.params;
-      const stmt = db.prepare("DELETE FROM product_comments WHERE id = ? AND user_id = ?");
-      const result = stmt.run(commentId, req.user.id);
-      if (result.changes === 0) {
-        return res.status(403).json({ error: "Unauthorized" });
+  apiRouter.delete(
+    "/products/:id/comments/:commentId",
+    authenticateToken,
+    (req: AuthRequest, res) => {
+      try {
+        const { commentId } = req.params;
+        const stmt = db.prepare(
+          "DELETE FROM product_comments WHERE id = ? AND user_id = ?"
+        );
+        const result = stmt.run(commentId, req.user!.id);
+        if (result.changes === 0) {
+          return res.status(403).json({ error: "Unauthorized" });
+        }
+        return res.json({ message: "Comment deleted" });
+      } catch {
+        return res.status(500).json({ error: "Failed to delete comment" });
       }
-      res.json({ message: "Comment deleted" });
-    } catch (error: any) {
-      res.status(500).json({ error: "Failed to delete comment" });
     }
-  });
+  );
 
   // Messaging
-  apiRouter.get("/conversations", authenticateToken, (req: any, res) => {
+  apiRouter.get("/conversations", authenticateToken, (req: AuthRequest, res) => {
     try {
-      const convs = db.prepare(`
+      const convs = db
+        .prepare(`
         SELECT c.*, u.name as other_name, u.profile_picture as other_avatar,
         (SELECT content FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) as last_message,
         (SELECT COUNT(*) FROM messages WHERE conversation_id = c.id AND sender_id != ? AND is_read = 0) as unread_count
@@ -1010,63 +1181,75 @@ async function startServer() {
         JOIN users u ON (u.id = c.user1_id OR u.id = c.user2_id) AND u.id != ?
         WHERE c.user1_id = ? OR c.user2_id = ?
         ORDER BY (SELECT created_at FROM messages WHERE conversation_id = c.id ORDER BY created_at DESC LIMIT 1) DESC
-      `).all(req.user.id, req.user.id, req.user.id, req.user.id);
+      `)
+        .all(req.user!.id, req.user!.id, req.user!.id, req.user!.id);
 
-      res.json(convs);
-    } catch (error: any) {
-      res.status(500).json({ error: "Failed to fetch conversations" });
+      return res.json(convs);
+    } catch {
+      return res.status(500).json({ error: "Failed to fetch conversations" });
     }
   });
 
-  apiRouter.post("/conversations", authenticateToken, (req: any, res) => {
+  apiRouter.post("/conversations", authenticateToken, (req: AuthRequest, res) => {
     const { other_id } = req.body;
 
     if (!other_id) {
       return res.status(400).json({ error: "Other user ID is required" });
     }
 
-    const user1 = Math.min(req.user.id, Number(other_id));
-    const user2 = Math.max(req.user.id, Number(other_id));
+    const user1 = Math.min(req.user!.id, Number(other_id));
+    const user2 = Math.max(req.user!.id, Number(other_id));
 
     try {
-      const result = db.prepare("INSERT INTO conversations (user1_id, user2_id) VALUES (?, ?)")
+      const result = db
+        .prepare("INSERT INTO conversations (user1_id, user2_id) VALUES (?, ?)")
         .run(user1, user2);
 
-      res.json({ id: Number(result.lastInsertRowid) });
-    } catch (err) {
-      const existing: any = db.prepare(
-        "SELECT id FROM conversations WHERE user1_id = ? AND user2_id = ?"
-      ).get(user1, user2);
+      return res.json({ id: Number(result.lastInsertRowid) });
+    } catch {
+      const existing: any = db
+        .prepare(
+          "SELECT id FROM conversations WHERE user1_id = ? AND user2_id = ?"
+        )
+        .get(user1, user2);
 
-      res.json(existing || { error: "Failed to create or find conversation" });
+      return res.json(existing || { error: "Failed to create or find conversation" });
     }
   });
 
-  apiRouter.get("/conversations/:id/messages", authenticateToken, (req: any, res) => {
-    try {
-      const messages = db.prepare(`
+  apiRouter.get(
+    "/conversations/:id/messages",
+    authenticateToken,
+    (req: AuthRequest, res) => {
+      try {
+        const messages = db
+          .prepare(`
         SELECT * FROM messages
         WHERE conversation_id = ?
         ORDER BY created_at ASC
-      `).all(req.params.id);
+      `)
+          .all(req.params.id);
 
-      db.prepare(
-        "UPDATE messages SET is_read = 1 WHERE conversation_id = ? AND sender_id != ?"
-      ).run(req.params.id, req.user.id);
+        db.prepare(
+          "UPDATE messages SET is_read = 1 WHERE conversation_id = ? AND sender_id != ?"
+        ).run(req.params.id, req.user!.id);
 
-      res.json(messages);
-    } catch (error: any) {
-      res.status(500).json({ error: "Failed to fetch messages" });
+        return res.json(messages);
+      } catch {
+        return res.status(500).json({ error: "Failed to fetch messages" });
+      }
     }
-  });
+  );
 
-  apiRouter.post("/messages", authenticateToken, (req: any, res) => {
+  apiRouter.post("/messages", authenticateToken, (req: AuthRequest, res) => {
     try {
-      const sender_id = Number(req.user.id);
+      const sender_id = Number(req.user!.id);
       const { receiver_id, content } = req.body;
 
       if (!receiver_id || !content || !String(content).trim()) {
-        return res.status(400).json({ error: "receiver_id and content are required" });
+        return res
+          .status(400)
+          .json({ error: "receiver_id and content are required" });
       }
 
       const rid = Number(receiver_id);
@@ -1078,21 +1261,23 @@ async function startServer() {
       const user1 = Math.min(sender_id, rid);
       const user2 = Math.max(sender_id, rid);
 
-      let conv: any = db.prepare(
-        "SELECT id FROM conversations WHERE user1_id = ? AND user2_id = ?"
-      ).get(user1, user2);
+      let conv: any = db
+        .prepare("SELECT id FROM conversations WHERE user1_id = ? AND user2_id = ?")
+        .get(user1, user2);
 
       if (!conv) {
-        const created = db.prepare(
-          "INSERT INTO conversations (user1_id, user2_id) VALUES (?, ?)"
-        ).run(user1, user2);
+        const created = db
+          .prepare("INSERT INTO conversations (user1_id, user2_id) VALUES (?, ?)")
+          .run(user1, user2);
 
         conv = { id: Number(created.lastInsertRowid) };
       }
 
-      const result = db.prepare(
-        "INSERT INTO messages (conversation_id, sender_id, content) VALUES (?, ?, ?)"
-      ).run(conv.id, sender_id, content.trim());
+      const result = db
+        .prepare(
+          "INSERT INTO messages (conversation_id, sender_id, content) VALUES (?, ?, ?)"
+        )
+        .run(conv.id, sender_id, content.trim());
 
       const message = {
         id: Number(result.lastInsertRowid),
@@ -1105,50 +1290,57 @@ async function startServer() {
 
       io.to(`user_${rid}`).emit("receive_message", message);
 
-      res.json({ success: true, conversation_id: conv.id, message });
+      return res.json({ success: true, conversation_id: conv.id, message });
     } catch (error: any) {
       console.error("POST /api/messages error:", error);
-      res.status(500).json({ error: "Failed to send message" });
+      return res.status(500).json({ error: "Failed to send message" });
     }
   });
 
   // Admin
-  apiRouter.get("/admin/reports", authenticateToken, (req: any, res) => {
-    const user: any = db.prepare("SELECT role FROM users WHERE id = ?").get(req.user.id);
+  apiRouter.get("/admin/reports", authenticateToken, (req: AuthRequest, res) => {
+    const user: any = db
+      .prepare("SELECT role FROM users WHERE id = ?")
+      .get(req.user!.id);
 
     if (!user || user.role !== "admin") {
       return res.status(403).json({ error: "Admin access only" });
     }
 
-    const reports = db.prepare(`
+    const reports = db
+      .prepare(`
       SELECT r.*, p.content as post_content, u.name as reporter_name
       FROM reports r
       JOIN posts p ON r.post_id = p.id
       JOIN users u ON r.user_id = u.id
       ORDER BY r.created_at DESC
-    `).all();
+    `)
+      .all();
 
-    res.json(reports);
+    return res.json(reports);
   });
 
   // Q&A
-  apiRouter.post("/questions", authenticateToken, (req: any, res) => {
+  apiRouter.post("/questions", authenticateToken, (req: AuthRequest, res) => {
     const { title, description } = req.body;
 
     if (!title || !description) {
       return res.status(400).json({ error: "Title & description required" });
     }
 
-    const result = db.prepare(`
+    const result = db
+      .prepare(`
       INSERT INTO questions (user_id, title, description)
       VALUES (?, ?, ?)
-    `).run(req.user.id, title, description);
+    `)
+      .run(req.user!.id, title, description);
 
-    res.json({ id: Number(result.lastInsertRowid) });
+    return res.json({ id: Number(result.lastInsertRowid) });
   });
 
-  apiRouter.get("/questions", authenticateToken, (req: any, res) => {
-    const questions = db.prepare(`
+  apiRouter.get("/questions", authenticateToken, (_req: AuthRequest, res) => {
+    const questions = db
+      .prepare(`
       SELECT 
         q.*,
         u.name as author_name,
@@ -1156,116 +1348,136 @@ async function startServer() {
       FROM questions q
       JOIN users u ON q.user_id = u.id
       ORDER BY q.created_at DESC
-    `).all();
+    `)
+      .all();
 
-    res.json(questions);
+    return res.json(questions);
   });
 
-  apiRouter.get("/questions/:id", authenticateToken, (req: any, res) => {
-    const question = db.prepare(`
+  apiRouter.get("/questions/:id", authenticateToken, (req: AuthRequest, res) => {
+    const question = db
+      .prepare(`
       SELECT q.*, u.name as author_name
       FROM questions q
       JOIN users u ON q.user_id = u.id
       WHERE q.id = ?
-    `).get(req.params.id);
+    `)
+      .get(req.params.id);
 
     if (!question) {
       return res.status(404).json({ error: "Question not found" });
     }
 
-    const answers = db.prepare(`
+    const answers = db
+      .prepare(`
       SELECT a.*, u.name as author_name
       FROM answers a
       JOIN users u ON a.user_id = u.id
       WHERE a.question_id = ?
       ORDER BY a.is_best DESC, a.created_at ASC
-    `).all(req.params.id);
+    `)
+      .all(req.params.id);
 
-    res.json({ question, answers });
+    return res.json({ question, answers });
   });
 
-  apiRouter.post("/questions/:id/answers", authenticateToken, (req: any, res) => {
+  apiRouter.post("/questions/:id/answers", authenticateToken, (req: AuthRequest, res) => {
     const { content } = req.body;
 
     if (!content || !content.trim()) {
       return res.status(400).json({ error: "Answer required" });
     }
 
-    const result = db.prepare(`
+    const result = db
+      .prepare(`
       INSERT INTO answers (question_id, user_id, content)
       VALUES (?, ?, ?)
-    `).run(req.params.id, req.user.id, content);
+    `)
+      .run(req.params.id, req.user!.id, content);
 
-    const user: any = db.prepare("SELECT name FROM users WHERE id = ?").get(req.user.id);
+    const user: any = db
+      .prepare("SELECT name FROM users WHERE id = ?")
+      .get(req.user!.id);
 
-    res.json({
+    return res.json({
       id: Number(result.lastInsertRowid),
       content,
-      user_id: req.user.id,
+      user_id: req.user!.id,
       author_name: user?.name || "Unknown",
     });
   });
 
-  apiRouter.put("/answers/:id/best", authenticateToken, (req: any, res) => {
-    const answer: any = db.prepare(`
+  apiRouter.put("/answers/:id/best", authenticateToken, (req: AuthRequest, res) => {
+    const answer: any = db
+      .prepare(`
       SELECT a.*, q.user_id as question_owner
       FROM answers a
       JOIN questions q ON a.question_id = q.id
       WHERE a.id = ?
-    `).get(req.params.id);
+    `)
+      .get(req.params.id);
 
-    if (!answer || answer.question_owner !== req.user.id) {
+    if (!answer || answer.question_owner !== req.user!.id) {
       return res.status(403).json({ error: "Not allowed" });
     }
 
-    db.prepare("UPDATE answers SET is_best = 0 WHERE question_id = ?")
-      .run(answer.question_id);
+    db.prepare("UPDATE answers SET is_best = 0 WHERE question_id = ?").run(
+      answer.question_id
+    );
 
-    db.prepare("UPDATE answers SET is_best = 1 WHERE id = ?")
-      .run(req.params.id);
+    db.prepare("UPDATE answers SET is_best = 1 WHERE id = ?").run(req.params.id);
 
-    res.json({ success: true });
+    return res.json({ success: true });
   });
 
-  apiRouter.delete("/questions/:id", authenticateToken, (req: any, res) => {
-    const question: any = db.prepare("SELECT * FROM questions WHERE id = ?").get(req.params.id);
+  apiRouter.delete("/questions/:id", authenticateToken, (req: AuthRequest, res) => {
+    const question: any = db
+      .prepare("SELECT * FROM questions WHERE id = ?")
+      .get(req.params.id);
 
-    if (!question || question.user_id !== req.user.id) {
+    if (!question || question.user_id !== req.user!.id) {
       return res.status(403).json({ error: "Not allowed" });
     }
 
     db.prepare("DELETE FROM questions WHERE id = ?").run(req.params.id);
 
-    res.json({ deleted: true });
+    return res.json({ deleted: true });
   });
 
-  apiRouter.delete("/answers/:id", authenticateToken, (req: any, res) => {
-    const answer: any = db.prepare("SELECT * FROM answers WHERE id = ?").get(req.params.id);
+  apiRouter.delete("/answers/:id", authenticateToken, (req: AuthRequest, res) => {
+    const answer: any = db
+      .prepare("SELECT * FROM answers WHERE id = ?")
+      .get(req.params.id);
 
-    if (!answer || Number(answer.user_id) !== Number(req.user.id)) {
+    if (!answer || Number(answer.user_id) !== Number(req.user!.id)) {
       return res.status(403).json({ error: "Not allowed" });
     }
 
     db.prepare("DELETE FROM answers WHERE id = ?").run(req.params.id);
 
-    res.json({ deleted: true });
+    return res.json({ deleted: true });
   });
 
-  apiRouter.put("/answers/:id", authenticateToken, (req: any, res) => {
+  apiRouter.put("/answers/:id", authenticateToken, (req: AuthRequest, res) => {
     const { content } = req.body;
-    const answer: any = db.prepare("SELECT * FROM answers WHERE id = ?").get(req.params.id);
+    const answer: any = db
+      .prepare("SELECT * FROM answers WHERE id = ?")
+      .get(req.params.id);
 
-    if (!answer || Number(answer.user_id) !== Number(req.user.id)) {
+    if (!answer || Number(answer.user_id) !== Number(req.user!.id)) {
       return res.status(403).json({ error: "Not allowed" });
     }
 
-    db.prepare("UPDATE answers SET content = ? WHERE id = ?").run(content, req.params.id);
+    db.prepare("UPDATE answers SET content = ? WHERE id = ?").run(
+      content,
+      req.params.id
+    );
 
-    res.json({ updated: true });
+    return res.json({ updated: true });
   });
 
   // Investor Requests
-  apiRouter.post("/investor-requests", authenticateToken, (req: any, res) => {
+  apiRouter.post("/investor-requests", authenticateToken, (req: AuthRequest, res) => {
     try {
       const {
         startup_name,
@@ -1294,33 +1506,36 @@ async function startServer() {
         return res.status(400).json({ error: "Pitch must be within 600 characters" });
       }
 
-      const result = db.prepare(`
+      const result = db
+        .prepare(`
         INSERT INTO investor_requests (
           user_id, startup_name, website_url, launched_date,
           monthly_revenue, users_count, amount_raising, pitch
         )
         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        req.user.id,
-        String(startup_name).trim(),
-        website_url ? String(website_url).trim() : null,
-        String(launched_date).trim(),
-        monthly_revenue ? String(monthly_revenue).trim() : null,
-        usersNum,
-        raiseNum,
-        String(pitch).trim()
-      );
+      `)
+        .run(
+          req.user!.id,
+          String(startup_name).trim(),
+          website_url ? String(website_url).trim() : null,
+          String(launched_date).trim(),
+          monthly_revenue ? String(monthly_revenue).trim() : null,
+          usersNum,
+          raiseNum,
+          String(pitch).trim()
+        );
 
-      res.json({ id: Number(result.lastInsertRowid) });
+      return res.json({ id: Number(result.lastInsertRowid) });
     } catch (e: any) {
       console.error("POST /investor-requests error:", e);
-      res.status(500).json({ error: "Failed to create request" });
+      return res.status(500).json({ error: "Failed to create request" });
     }
   });
 
-  apiRouter.get("/investor-requests", authenticateToken, (req: any, res) => {
+  apiRouter.get("/investor-requests", authenticateToken, (_req: AuthRequest, res) => {
     try {
-      const rows = db.prepare(`
+      const rows = db
+        .prepare(`
         SELECT
           r.*,
           u.name as founder_name,
@@ -1330,18 +1545,20 @@ async function startServer() {
         FROM investor_requests r
         JOIN users u ON r.user_id = u.id
         ORDER BY r.created_at DESC
-      `).all();
+      `)
+        .all();
 
-      res.json(rows);
+      return res.json(rows);
     } catch (e: any) {
       console.error("GET /investor-requests error:", e);
-      res.status(500).json({ error: "Failed to fetch requests" });
+      return res.status(500).json({ error: "Failed to fetch requests" });
     }
   });
 
-  apiRouter.get("/investor-requests/:id", authenticateToken, (req: any, res) => {
+  apiRouter.get("/investor-requests/:id", authenticateToken, (req: AuthRequest, res) => {
     try {
-      const row: any = db.prepare(`
+      const row: any = db
+        .prepare(`
         SELECT
           r.*,
           u.name as founder_name,
@@ -1351,28 +1568,35 @@ async function startServer() {
         FROM investor_requests r
         JOIN users u ON r.user_id = u.id
         WHERE r.id = ?
-      `).get(req.params.id);
+      `)
+        .get(req.params.id);
 
-      if (!row) return res.status(404).json({ error: "Request not found" });
+      if (!row) {
+        return res.status(404).json({ error: "Request not found" });
+      }
 
-      res.json(row);
+      return res.json(row);
     } catch (e: any) {
       console.error("GET /investor-requests/:id error:", e);
-      res.status(500).json({ error: "Failed to fetch request" });
+      return res.status(500).json({ error: "Failed to fetch request" });
     }
   });
 
-  apiRouter.put("/investor-requests/:id", authenticateToken, (req: any, res) => {
+  apiRouter.put("/investor-requests/:id", authenticateToken, (req: AuthRequest, res) => {
     try {
       const id = Number(req.params.id);
-      if (isNaN(id)) return res.status(400).json({ error: "Invalid id" });
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "Invalid id" });
+      }
 
       const existing: any = db
         .prepare("SELECT id, user_id FROM investor_requests WHERE id = ?")
         .get(id);
 
-      if (!existing) return res.status(404).json({ error: "Request not found" });
-      if (Number(existing.user_id) !== Number(req.user.id)) {
+      if (!existing) {
+        return res.status(404).json({ error: "Request not found" });
+      }
+      if (Number(existing.user_id) !== Number(req.user!.id)) {
         return res.status(403).json({ error: "Not allowed" });
       }
 
@@ -1403,61 +1627,73 @@ async function startServer() {
         return res.status(400).json({ error: "Pitch must be within 600 characters" });
       }
 
-      const result = db.prepare(`
+      const result = db
+        .prepare(`
         UPDATE investor_requests
         SET startup_name = ?, website_url = ?, launched_date = ?,
             monthly_revenue = ?, users_count = ?, amount_raising = ?, pitch = ?
         WHERE id = ? AND user_id = ?
-      `).run(
-        String(startup_name).trim(),
-        website_url ? String(website_url).trim() : null,
-        String(launched_date).trim(),
-        monthly_revenue ? String(monthly_revenue).trim() : null,
-        usersNum,
-        raiseNum,
-        String(pitch).trim(),
-        id,
-        req.user.id
-      );
+      `)
+        .run(
+          String(startup_name).trim(),
+          website_url ? String(website_url).trim() : null,
+          String(launched_date).trim(),
+          monthly_revenue ? String(monthly_revenue).trim() : null,
+          usersNum,
+          raiseNum,
+          String(pitch).trim(),
+          id,
+          req.user!.id
+        );
 
       if (result.changes === 0) {
         return res.status(403).json({ error: "Not allowed" });
       }
 
-      res.json({ updated: true });
+      return res.json({ updated: true });
     } catch (e: any) {
       console.error("PUT /investor-requests/:id error:", e);
-      res.status(500).json({ error: "Failed to update request" });
+      return res.status(500).json({ error: "Failed to update request" });
     }
   });
 
-  apiRouter.delete("/investor-requests/:id", authenticateToken, (req: any, res) => {
+  apiRouter.delete("/investor-requests/:id", authenticateToken, (req: AuthRequest, res) => {
     try {
       const id = Number(req.params.id);
-      if (isNaN(id)) return res.status(400).json({ error: "Invalid id" });
+      if (isNaN(id)) {
+        return res.status(400).json({ error: "Invalid id" });
+      }
 
       const row: any = db
         .prepare("SELECT id, user_id FROM investor_requests WHERE id = ?")
         .get(id);
 
-      if (!row) return res.status(404).json({ error: "Request not found" });
-      if (Number(row.user_id) !== Number(req.user.id)) {
+      if (!row) {
+        return res.status(404).json({ error: "Request not found" });
+      }
+      if (Number(row.user_id) !== Number(req.user!.id)) {
         return res.status(403).json({ error: "Not allowed" });
       }
 
       db.prepare("DELETE FROM investor_requests WHERE id = ?").run(id);
 
-      res.json({ deleted: true });
+      return res.json({ deleted: true });
     } catch (e: any) {
       console.error("DELETE /investor-requests/:id error:", e);
-      res.status(500).json({ error: "Failed to delete request" });
+      return res.status(500).json({ error: "Failed to delete request" });
     }
   });
 
   // Partner Requests
-  apiRouter.post("/partner-requests", authenticateToken, (req: any, res) => {
+  apiRouter.post("/partner-requests", authenticateToken, (req: AuthRequest, res) => {
     try {
-      const { startup_name, website_url, monthly_revenue, needed_role, description } = req.body;
+      const {
+        startup_name,
+        website_url,
+        monthly_revenue,
+        needed_role,
+        description,
+      } = req.body;
 
       if (!startup_name || !needed_role || !description) {
         return res.status(400).json({ error: "Required fields missing" });
@@ -1467,72 +1703,82 @@ async function startServer() {
         return res.status(400).json({ error: "Description too long" });
       }
 
-      const result = db.prepare(`
+      const result = db
+        .prepare(`
         INSERT INTO partner_requests
         (user_id, startup_name, website_url, monthly_revenue, needed_role, description)
         VALUES (?, ?, ?, ?, ?, ?)
-      `).run(
-        req.user.id,
-        startup_name,
-        website_url || null,
-        monthly_revenue || null,
-        needed_role,
-        description
-      );
+      `)
+        .run(
+          req.user!.id,
+          startup_name,
+          website_url || null,
+          monthly_revenue || null,
+          needed_role,
+          description
+        );
 
-      res.json({ id: Number(result.lastInsertRowid) });
+      return res.json({ id: Number(result.lastInsertRowid) });
     } catch (e) {
       console.error(e);
-      res.status(500).json({ error: "Failed to create request" });
+      return res.status(500).json({ error: "Failed to create request" });
     }
   });
 
-  apiRouter.get("/partner-requests", authenticateToken, (req: any, res) => {
+  apiRouter.get("/partner-requests", authenticateToken, (_req: AuthRequest, res) => {
     try {
-      const rows = db.prepare(`
+      const rows = db
+        .prepare(`
         SELECT p.*, u.name as founder_name, u.profile_picture as founder_avatar
         FROM partner_requests p
         JOIN users u ON p.user_id = u.id
         ORDER BY p.id DESC
-      `).all();
+      `)
+        .all();
 
-      res.json(rows);
+      return res.json(rows);
     } catch (e) {
       console.error(e);
-      res.status(500).json({ error: "Failed to fetch requests" });
+      return res.status(500).json({ error: "Failed to fetch requests" });
     }
   });
 
-  apiRouter.delete("/partner-requests/:id", authenticateToken, (req: any, res) => {
+  apiRouter.delete("/partner-requests/:id", authenticateToken, (req: AuthRequest, res) => {
     try {
-      const request: any = db.prepare("SELECT * FROM partner_requests WHERE id = ?")
+      const request: any = db
+        .prepare("SELECT * FROM partner_requests WHERE id = ?")
         .get(req.params.id);
 
-      if (!request) return res.status(404).json({ error: "Not found" });
+      if (!request) {
+        return res.status(404).json({ error: "Not found" });
+      }
 
-      if (request.user_id !== req.user.id) {
+      if (request.user_id !== req.user!.id) {
         return res.status(403).json({ error: "Unauthorized" });
       }
 
       db.prepare("DELETE FROM partner_requests WHERE id = ?").run(req.params.id);
 
-      res.json({ success: true });
+      return res.json({ success: true });
     } catch (e) {
       console.error(e);
-      res.status(500).json({ error: "Delete failed" });
+      return res.status(500).json({ error: "Delete failed" });
     }
   });
 
   // Search
-  apiRouter.get("/search", authenticateToken, (req: any, res) => {
+  apiRouter.get("/search", authenticateToken, (req: AuthRequest, res) => {
     try {
       const q = String(req.query.q || "").trim();
-      if (!q) return res.json({ founders: [], posts: [], products: [] });
+      if (!q) {
+        return res.json({ founders: [], posts: [], products: [] });
+      }
 
       const like = `%${q}%`;
       const limit = Math.min(parseInt(req.query.limit as string) || 10, 50);
 
-      const founders = db.prepare(`
+      const founders = db
+        .prepare(`
         SELECT id, name, startup_name, role, bio, website, profile_picture, location
         FROM users
         WHERE
@@ -1542,9 +1788,11 @@ async function startServer() {
           LOWER(bio) LIKE LOWER(?)
         ORDER BY created_at DESC
         LIMIT ?
-      `).all(like, like, like, like, limit);
+      `)
+        .all(like, like, like, like, limit);
 
-      const posts = db.prepare(`
+      const posts = db
+        .prepare(`
         SELECT p.*, u.name as author_name, u.startup_name, u.role, u.profile_picture as author_avatar,
           (SELECT COUNT(*) FROM likes WHERE post_id = p.id) as likes_count,
           (SELECT COUNT(*) FROM comments WHERE post_id = p.id) as comments_count,
@@ -1558,9 +1806,11 @@ async function startServer() {
           LOWER(u.startup_name) LIKE LOWER(?)
         ORDER BY p.created_at DESC
         LIMIT ?
-      `).all(req.user.id, req.user.id, like, like, like, limit);
+      `)
+        .all(req.user!.id, req.user!.id, like, like, like, limit);
 
-      const products = db.prepare(`
+      const products = db
+        .prepare(`
         SELECT p.*, u.name as founder_name, u.profile_picture as founder_avatar,
           (SELECT COUNT(*) FROM product_likes WHERE product_id = p.id) as likes_count,
           (SELECT COUNT(*) FROM product_comments WHERE product_id = p.id) as comments_count,
@@ -1570,12 +1820,13 @@ async function startServer() {
         WHERE p.name LIKE ? OR p.short_description LIKE ? OR p.problem_solved LIKE ?
         ORDER BY p.created_at DESC
         LIMIT ?
-      `).all(req.user.id, like, like, like, limit);
+      `)
+        .all(req.user!.id, like, like, like, limit);
 
-      res.json({ founders, posts, products });
+      return res.json({ founders, posts, products });
     } catch (error: any) {
       console.error("Search error:", error);
-      res.status(500).json({ error: "Failed to search" });
+      return res.status(500).json({ error: "Failed to search" });
     }
   });
 
@@ -1584,7 +1835,9 @@ async function startServer() {
 
   // Catch-all for API routes
   app.use("/api/*", (req, res) => {
-    res.status(404).json({ error: `API route not found: ${req.method} ${req.originalUrl}` });
+    return res
+      .status(404)
+      .json({ error: `API route not found: ${req.method} ${req.originalUrl}` });
   });
 
   // Socket.io
@@ -1615,13 +1868,20 @@ async function startServer() {
   });
 
   // Global error handler
-  app.use((err: any, req: any, res: any, next: any) => {
-    console.error("Unhandled error:", err);
-    res.status(500).json({
-      error: "Internal Server Error",
-      message: err.message,
-    });
-  });
+  app.use(
+    (
+      err: any,
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction
+    ) => {
+      console.error("Unhandled error:", err);
+      return res.status(500).json({
+        error: "Internal Server Error",
+        message: err.message,
+      });
+    }
+  );
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {
@@ -1631,10 +1891,25 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    app.use(express.static(path.join(__dirname, "dist")));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(__dirname, "dist", "index.html"));
-    });
+    const distPath = path.join(__dirname, "dist");
+    const shouldServeFrontend = process.env.SERVE_FRONTEND === "true";
+
+    if (shouldServeFrontend && fs.existsSync(distPath)) {
+      app.use(express.static(distPath));
+      app.get("*", (req, res, next) => {
+        if (req.path.startsWith("/api")) {
+          return next();
+        }
+        return res.sendFile(path.join(distPath, "index.html"));
+      });
+    } else {
+      app.get("/", (_req, res) => {
+        return res.json({
+          ok: true,
+          message: "Backend is running",
+        });
+      });
+    }
   }
 
   httpServer.listen(PORT, "0.0.0.0", () => {
